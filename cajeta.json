@@ -24,19 +24,20 @@
         "capabilities": ["env", "filesystem", "network"],
 
         "dependencies": {
-            "dev.cajeta.cloud":  "0.4.0",
-            "dev.cajeta.http":   "0.9.1",
-            "dev.cajeta.crypto": "0.1.0"
+            "dev.cajeta.cloud":  "0.4.1",
+            "dev.cajeta.http":   "0.9.1"
         },
 
-        // dev.cajeta.codec 0.9.0 (the XML reader) comes in as an override,
-        // not a direct dependency: http 0.9.1 pins codec 0.8.7 exactly, and
-        // the resolver applies an override only to a package that is not
-        // also a direct dependency, so a direct 0.9.0 pin does not resolve.
-        // 0.9.0 only adds dev.cajeta.codec.xml. Once http pins 0.9.0, make
-        // codec a direct dependency again and drop this.
+        // codec 0.9.1 (the XML reader) and crypto 0.1.1 (its skills) come in
+        // as overrides, not direct dependencies: http 0.9.1 pins codec 0.8.7
+        // and crypto 0.1.0 exactly, cloud 0.4.1 pins crypto 0.1.0, and the
+        // resolver applies an override only to a package that is not also a
+        // direct dependency, so direct pins do not resolve. Both are additive
+        // over what http and cloud pin. Make them direct again once those pin
+        // the same versions.
         "overrides": {
-            "dev.cajeta.codec": "0.9.0"
+            "dev.cajeta.codec":  "0.9.1",
+            "dev.cajeta.crypto": "0.1.1"
         },
 
         "dev-dependencies": {
