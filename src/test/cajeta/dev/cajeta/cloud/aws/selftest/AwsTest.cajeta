@@ -1,0 +1,17 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.aws.Aws;
+
+public class AwsTest {
+
+    public AwsTest() {
+        return;
+    }
+
+    @Test
+    public void versionIsTheManifestVersion() {
+        Assert.that(Aws.version()).isEqualTo("0.1.0");
+        return;
+    }
+}

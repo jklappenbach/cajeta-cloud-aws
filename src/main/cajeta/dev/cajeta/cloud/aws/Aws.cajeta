@@ -1,0 +1,15 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+
+/**
+ * The AWS adapters for `dev.cajeta.cloud`'s ports: Cognito for identity and
+ * S3 for the object store, SigV4-signed over cajeta-http.
+ */
+public final class Aws {
+    /** This library's version, the literal of `details.version`; run-tests.sh checks they agree. */
+    public static String version() { return "0.1.0"; }
+
+    /** Archive entry point for `--emit=cja`; does nothing. */
+    public static int32 run() { return 0; }
+}
