@@ -34,12 +34,14 @@ sha256_of() {
     else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
-# The version cajeta.json pins for <name>, from dependencies or dev-dependencies.
+# The version cajeta.json pins for <name>: dependencies, dev-dependencies, or
+# overrides (codec is an override; see the note in cajeta.json).
 pin_of() {
     python3 -c 'import json,re,sys
 t=re.sub(r"(?m)^\s*//.*$","",open(sys.argv[1]).read())
 s=json.loads(t)["settings"]
 d=dict(s.get("dependencies",{})); d.update(s.get("dev-dependencies",{}))
+for k,v in s.get("overrides",{}).items(): d.setdefault(k, v if isinstance(v,str) else v.get("version",""))
 print(d.get(sys.argv[2],""))' "$here/cajeta.json" "$1"
 }
 
