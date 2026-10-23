@@ -105,4 +105,4 @@ echo ">> building + running the test binary"
     dev.cajeta.cloud.aws.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
 # The SigV4 test-suite vectors (awslabs/aws-c-auth, vendored) read from here.
-AWS_SIGV4_VECTORS="$here/src/test/resources/sigv4" "$out/awstests"
+AWS_SIGV4_VECTORS="$here/src/test/resources/sigv4" CAJETA_AWS_TEST_TMP="$out" "$out/awstests"

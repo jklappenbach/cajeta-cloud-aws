@@ -1,0 +1,35 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+
+/**
+ * Credentials and region an application declares explicitly, the first step
+ * of the credential chain (spec 2.1). Declare one as a component when the key
+ * comes from the application's own configuration rather than the environment.
+ * Any field may be null; a config without a key id and secret is skipped by
+ * the chain, and one without a region defers to AWS_REGION.
+ */
+public final class AwsConfig {
+    String accessKeyId;
+    String secretAccessKey;
+    String sessionToken;
+    String regionName;
+
+    public AwsConfig(String accessKeyId, String secretAccessKey, String sessionToken,
+                     String region) {
+        if (accessKeyId != null) this.accessKeyId #= accessKeyId;
+        if (secretAccessKey != null) this.secretAccessKey #= secretAccessKey;
+        if (sessionToken != null) this.sessionToken #= sessionToken;
+        if (region != null) this.regionName #= region;
+        return;
+    }
+
+    public String accessKeyId() { return this.accessKeyId; }
+    public String secretAccessKey() { return this.secretAccessKey; }
+    public String sessionToken() { return this.sessionToken; }
+    public String region() { return this.regionName; }
+
+    public #String toString() {
+        return "AwsConfig(" + this.accessKeyId + ", " + this.regionName + ")";
+    }
+}
