@@ -1,0 +1,222 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonValue;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.identity.Challenge;
+import dev.cajeta.cloud.identity.ChallengeAnswer;
+import dev.cajeta.cloud.identity.ChallengeKind;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.identity.SignInResult;
+import dev.cajeta.cloud.identity.Tokens;
+import dev.cajeta.cloud.aws.CognitoAuthenticator;
+import dev.cajeta.cloud.aws.CognitoClient;
+import dev.cajeta.cloud.aws.CognitoTime;
+
+/**
+ * Sign-in over USER_SRP_AUTH against FakeCognito, which checks the
+ * PASSWORD_CLAIM_SIGNATURE with its own server-side SRP (plan 3.1.1): tokens,
+ * a wrong password, a TOTP challenge answered, SECRET_HASH, the
+ * USER_PASSWORD_AUTH fallback when the app client has SRP off, refresh,
+ * revocation and the forgot-password pair. The password must never appear
+ * in a request body on the SRP path.
+ */
+public class CognitoAuthenticatorTest {
+    private static final String POOL_ID = "us-east-1_ExAmPlE12";
+    private static final String CLIENT = "3n4b5urk1ft4fl3mg5e62d9ado";
+    private static final String USER_ID = "4f3c2a10-9b7e-4d6a-8c21-0e5f7a9b3d14";
+    private static final String PASSWORD = "Correct-Horse-Battery-9";
+    private static final int64 NOW = 1767225660L;
+
+    public CognitoAuthenticatorTest() {
+        return;
+    }
+
+    @Test
+    public void srpSignInReturnsTokensAndNeverSendsThePassword() {
+        FakeCognito fake #= CognitoAuthenticatorTest.fake();
+        String access #= CognitoAuthenticatorTest.fixture("access.jwt");
+        String id #= CognitoAuthenticatorTest.fixture("id.jwt");
+        fake.tokens(access, id, "refresh-token-1");
+        CognitoAuthenticator auth #= CognitoAuthenticatorTest.authenticator(fake, null);
+        SignInResult r #= auth.signIn("ada", CognitoAuthenticatorTest.PASSWORD);
+        Assert.isTrue(r.isTokens());
+        Tokens t = r.tokens();
+        String at #= t.accessToken();
+        Assert.equals(access, at);
+        String rt #= t.refreshToken();
+        Assert.equals("refresh-token-1", rt);
+        Assert.isTrue(t.accessExpiresAt() == CognitoAuthenticatorTest.NOW + 3600L);
+        Assert.isTrue(fake.claimsChecked == 1);
+        Assert.isTrue(fake.calls() == 2);
+        Assert.equals("InitiateAuth", fake.opAt(0));
+        Assert.isTrue(fake.bodyAt(0).indexOf("\"USER_SRP_AUTH\"") >= 0L);
+        Assert.isTrue(fake.bodyAt(1).indexOf("\"Thu Jan 1 00:01:00 UTC 2026\"") >= 0L);
+        Assert.isTrue(fake.neverSent(CognitoAuthenticatorTest.PASSWORD));
+        Assert.isTrue(fake.neverSent("SECRET_HASH"));
+        return;
+    }
+
+    @Test
+    public void aWrongPasswordIsInvalidCredentials() {
+        FakeCognito fake #= CognitoAuthenticatorTest.fake();
+        CognitoAuthenticator auth #= CognitoAuthenticatorTest.authenticator(fake, null);
+        int32 kind = -1;
+        try {
+            SignInResult r #= auth.signIn("ada", "Wrong-Horse-Battery-9");
+        } catch (IdentityException e) {
+            kind = e.kind();
+            Assert.isTrue(e.message.indexOf("Wrong-Horse") < 0L);
+        }
+        Assert.isTrue(kind == IdentityException.INVALID_CREDENTIALS());
+        Assert.isTrue(fake.claimsChecked == 1);
+        return;
+    }
+
+    @Test
+    public void aTotpChallengeSurfacesAndIsAnswered() {
+        FakeCognito fake #= CognitoAuthenticatorTest.fake();
+        fake.reply(200, "{\"ChallengeName\":\"SOFTWARE_TOKEN_MFA\",\"ChallengeParameters\":{},"
+            + "\"Session\":\"AYABeExampleSessionThatIsLongEnough0123456789\"}");
+        String access #= CognitoAuthenticatorTest.fixture("access.jwt");
+        String id #= CognitoAuthenticatorTest.fixture("id.jwt");
+        fake.tokens(access, id, "refresh-token-1");
+        CognitoAuthenticator auth #= CognitoAuthenticatorTest.authenticator(fake, null);
+        SignInResult r #= auth.signIn("ada", CognitoAuthenticatorTest.PASSWORD);
+        Assert.isTrue(r.isChallenge());
+        Challenge c = r.challenge();
+        Assert.isTrue(c.kind() == ChallengeKind.TOTP());
+        String session #= c.session();
+        Assert.isTrue(session.byteLength() > 0);
+        ChallengeAnswer code #= ChallengeAnswer.code("123456");
+        SignInResult done #= auth.respond(session, ChallengeKind.TOTP(), code);
+        Assert.isTrue(done.isTokens());
+        JsonValue sent #= Json.parse(fake.bodyAt(2));
+        String name #= CognitoClient.text(sent, "ChallengeName");
+        Assert.equals("SOFTWARE_TOKEN_MFA", name);
+        String echoed #= CognitoClient.text(sent, "Session");
+        Assert.equals("AYABeExampleSessionThatIsLongEnough0123456789", echoed);
+        JsonValue answers = sent.object().get("ChallengeResponses");
+        String codeSent #= CognitoClient.text(answers, "SOFTWARE_TOKEN_MFA_CODE");
+        Assert.equals("123456", codeSent);
+        String user #= CognitoClient.text(answers, "USERNAME");
+        Assert.equals(CognitoAuthenticatorTest.USER_ID, user);
+        return;
+    }
+
+    @Test
+    public void aClientWithASecretSendsSecretHash() {
+        FakeCognito fake #= CognitoAuthenticatorTest.fake();
+        String access #= CognitoAuthenticatorTest.fixture("access.jwt");
+        String id #= CognitoAuthenticatorTest.fixture("id.jwt");
+        fake.tokens(access, id, "refresh-token-1");
+        CognitoAuthenticator auth #= CognitoAuthenticatorTest.authenticator(fake, "cl1ent-s3cret-example");
+        SignInResult r #= auth.signIn("ada", CognitoAuthenticatorTest.PASSWORD);
+        Assert.isTrue(r.isTokens());
+        // HMAC(secret, "ada" + client id), then HMAC(secret, USER_ID_FOR_SRP + client id).
+        Assert.isTrue(fake.bodyAt(0).indexOf("TB8A8LzYJwu8hSxlV/u2lzvV985oevMz8ycuGAShe7o=") >= 0L);
+        Assert.isTrue(fake.bodyAt(1).indexOf("SECRET_HASH") >= 0L);
+        Assert.isTrue(fake.neverSent("cl1ent-s3cret-example"));
+        return;
+    }
+
+    @Test
+    public void aClientWithoutSrpFallsBackToThePasswordFlow() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.error("InvalidParameterException", "USER_SRP_AUTH is not enabled for the client.");
+        String access #= CognitoAuthenticatorTest.fixture("access.jwt");
+        String id #= CognitoAuthenticatorTest.fixture("id.jwt");
+        t.reply(200, "{\"AuthenticationResult\":{\"AccessToken\":\"" + access + "\",\"ExpiresIn\":3600,\"IdToken\":\""
+            + id + "\",\"RefreshToken\":\"r1\",\"TokenType\":\"Bearer\"},\"ChallengeParameters\":{}}");
+        CognitoClient client = heap CognitoClient("us-east-1", CognitoAuthenticatorTest.CLIENT, null, t);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoAuthenticatorTest.NOW);
+        CognitoAuthenticator auth = heap CognitoAuthenticator(client, CognitoAuthenticatorTest.POOL_ID, clock);
+        SignInResult r #= auth.signIn("ada", CognitoAuthenticatorTest.PASSWORD);
+        Assert.isTrue(r.isTokens());
+        Assert.isTrue(t.calls() == 2);
+        Assert.isTrue(t.bodyAt(1).indexOf("\"USER_PASSWORD_AUTH\"") >= 0L);
+        return;
+    }
+
+    @Test
+    public void refreshKeepsTheRefreshTokenAndRevokeSendsIt() {
+        ScriptedTransport t = heap ScriptedTransport();
+        String access #= CognitoAuthenticatorTest.fixture("access.jwt");
+        String id #= CognitoAuthenticatorTest.fixture("id.jwt");
+        t.reply(200, "{\"AuthenticationResult\":{\"AccessToken\":\"" + access + "\",\"ExpiresIn\":3600,\"IdToken\":\""
+            + id + "\",\"TokenType\":\"Bearer\"},\"ChallengeParameters\":{}}");
+        t.reply(200, "{}");
+        CognitoClient client = heap CognitoClient("us-east-1", CognitoAuthenticatorTest.CLIENT, null, t);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoAuthenticatorTest.NOW);
+        CognitoAuthenticator auth = heap CognitoAuthenticator(client, CognitoAuthenticatorTest.POOL_ID, clock);
+        Tokens fresh #= auth.refresh("refresh-token-1");
+        String rt #= fresh.refreshToken();
+        Assert.equals("refresh-token-1", rt);
+        Assert.isTrue(t.bodyAt(0).indexOf("\"REFRESH_TOKEN_AUTH\"") >= 0L);
+        auth.signOut("refresh-token-1");
+        Assert.equals("RevokeToken", t.opAt(1));
+        JsonValue sent #= Json.parse(t.bodyAt(1));
+        String tok #= CognitoClient.text(sent, "Token");
+        Assert.equals("refresh-token-1", tok);
+        return;
+    }
+
+    @Test
+    public void forgotPasswordAndItsConfirmation() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.reply(200, "{\"CodeDeliveryDetails\":{\"AttributeName\":\"email\",\"DeliveryMedium\":\"EMAIL\",\"Destination\":\"a***@e***\"}}");
+        t.error("CodeMismatchException", "Invalid verification code provided, please try again.");
+        CognitoClient client = heap CognitoClient("us-east-1", CognitoAuthenticatorTest.CLIENT, null, t);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoAuthenticatorTest.NOW);
+        CognitoAuthenticator auth = heap CognitoAuthenticator(client, CognitoAuthenticatorTest.POOL_ID, clock);
+        auth.forgotPassword("ada");
+        Assert.equals("ForgotPassword", t.opAt(0));
+        int32 kind = -1;
+        try {
+            auth.confirmForgotPassword("ada", "000000", "New-Horse-Battery-10");
+        } catch (IdentityException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == IdentityException.INVALID_CODE());
+        JsonValue sent #= Json.parse(t.bodyAt(1));
+        String code #= CognitoClient.text(sent, "ConfirmationCode");
+        Assert.equals("000000", code);
+        return;
+    }
+
+    @Test
+    public void theTimestampIsCognitosFormat() {
+        String a #= CognitoTime.timestamp(1772694249L);
+        Assert.equals("Thu Mar 5 07:04:09 UTC 2026", a);
+        String b #= CognitoTime.timestamp(1798243199L);
+        Assert.equals("Fri Dec 25 23:59:59 UTC 2026", b);
+        return;
+    }
+
+    private static #FakeCognito fake() {
+        return heap FakeCognito("ExAmPlE12", CognitoAuthenticatorTest.USER_ID, CognitoAuthenticatorTest.PASSWORD);
+    }
+
+    private static #CognitoAuthenticator authenticator(FakeCognito fake, String secret) {
+        CognitoClient client = heap CognitoClient("us-east-1", CognitoAuthenticatorTest.CLIENT, secret, fake);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoAuthenticatorTest.NOW);
+        return heap CognitoAuthenticator(#client, CognitoAuthenticatorTest.POOL_ID, #clock);
+    }
+
+    private static #String fixture(String name) {
+        String root = System.env.get("COGNITO_FIXTURES");
+        if (root == null) {
+            Assert.fail("COGNITO_FIXTURES is not set; run through run-tests.sh");
+        }
+        String path #= root + "/" + name;
+        int8[] bytes #= File.readAllBytes(path);
+        if (bytes == null) {
+            Assert.fail("missing fixture " + path);
+        }
+        int32 n = (int32) bytes.count();
+        return heap String(#bytes, n);
+    }
+}

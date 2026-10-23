@@ -1,0 +1,52 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import dev.cajeta.cloud.identity.Jwt;
+
+/** A compact JSON object writer for cognito-idp request documents. */
+final class CognitoJson {
+    StringBuilder out;
+    boolean first;
+
+    CognitoJson() {
+        this.out = heap StringBuilder();
+        this.out.append("{");
+        this.first = true;
+        return;
+    }
+
+    private void name(String n) {
+        if (!this.first) this.out.append(",");
+        this.first = false;
+        String q #= Jwt.quote(n);
+        this.out.append(q);
+        this.out.append(":");
+    }
+
+    CognitoJson str(String n, String value) {
+        this.name(n);
+        String q #= Jwt.quote(value);
+        this.out.append(q);
+        return this;
+    }
+
+    /** Opens a nested object member; close() ends it. */
+    CognitoJson open(String n) {
+        this.name(n);
+        this.out.append("{");
+        this.first = true;
+        return this;
+    }
+
+    CognitoJson close() {
+        this.out.append("}");
+        this.first = false;
+        return this;
+    }
+
+    #String done() {
+        this.out.append("}");
+        return this.out.toString();
+    }
+}

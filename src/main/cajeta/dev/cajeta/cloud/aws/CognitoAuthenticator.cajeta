@@ -1,0 +1,390 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.codec.Base64;
+import cajeta.codec.Base64Exception;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonValue;
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.Authenticator;
+import dev.cajeta.cloud.identity.Challenge;
+import dev.cajeta.cloud.identity.ChallengeAnswer;
+import dev.cajeta.cloud.identity.ChallengeKind;
+import dev.cajeta.cloud.identity.Claims;
+import dev.cajeta.cloud.identity.DecodedJwt;
+import dev.cajeta.cloud.identity.Factor;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.Jwt;
+import dev.cajeta.cloud.identity.SignInResult;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.identity.Tokens;
+import dev.cajeta.cloud.identity.TotpEnrollment;
+import dev.cajeta.crypto.Srp;
+
+/**
+ * Sign-in against a Cognito user pool (identity spec §4, §6, §14.3).
+ *
+ * `signIn` runs USER_SRP_AUTH: the password never leaves the process. The
+ * client sends SRP_A, Cognito answers PASSWORD_VERIFIER with its B, salt
+ * and secret block, and the client answers with the HMAC claim (crypto's
+ * [[Srp]]). Only when the app client has SRP disabled does it fall back to
+ * USER_PASSWORD_AUTH. Further challenges surface with an opaque session
+ * handle that carries the user name and Cognito's challenge name with
+ * Cognito's session, so `respond` can answer in Cognito's terms.
+ *
+ * Refresh keeps the presented refresh token unless Cognito rotates it.
+ * `signOut` revokes the refresh token; access and id tokens already issued
+ * stay valid offline until they expire (§4.6). With an app client secret,
+ * REFRESH_TOKEN_AUTH would need the user's name for SECRET_HASH, which the
+ * port's refresh does not carry, so refresh is sent without it.
+ */
+public final class CognitoAuthenticator implements Authenticator {
+    CognitoClient client;
+    String poolName;
+    TimeSource clock;
+
+    public CognitoAuthenticator(CognitoClient client, String userPoolId, TimeSource clock) {
+        this.client #= client;
+        int64 us = userPoolId.indexOf("_");
+        String bare #= userPoolId.substring((int32) (us + 1L), userPoolId.byteLength());
+        this.poolName #= bare;
+        this.clock #= clock;
+        return;
+    }
+
+    public #SignInResult signIn(String username, String password) {
+        Srp srp #= Srp.random();
+        String srpA #= srp.publicHex();
+        CognitoJson j = heap CognitoJson();
+        String cid #= this.client.appClientId();
+        j.str("AuthFlow", "USER_SRP_AUTH");
+        j.str("ClientId", cid);
+        j.open("AuthParameters");
+        j.str("USERNAME", username);
+        j.str("SRP_A", srpA);
+        if (this.client.hasSecret()) {
+            String h #= this.client.secretHash(username);
+            j.str("SECRET_HASH", h);
+        }
+        j.close();
+        String body #= j.done();
+        JsonValue first = null;
+        boolean fallback = false;
+        try {
+            first #= this.client.call("InitiateAuth", username, body);
+        } catch (IdentityException e) {
+            if (!CognitoAuthenticator.srpUnavailable(e)) throw e;
+            fallback = true;
+        }
+        if (fallback) return this.passwordSignIn(username, password);
+
+        String challenge #= CognitoClient.text(first, "ChallengeName");
+        if (!challenge.equals("PASSWORD_VERIFIER")) {
+            return this.outcome(first, username);
+        }
+        JsonValue params = first.object().get("ChallengeParameters");
+        String userId #= CognitoClient.text(params, "USER_ID_FOR_SRP");
+        String internal #= CognitoClient.text(params, "USERNAME");
+        if (internal.byteLength() == 0) internal #= "" + username;
+        String salt #= CognitoClient.text(params, "SALT");
+        String srpB #= CognitoClient.text(params, "SRP_B");
+        String block #= CognitoClient.text(params, "SECRET_BLOCK");
+        int8[] key #= srp.passwordKey(this.poolName, userId, password, salt, srpB);
+        String ts #= CognitoTime.timestamp(this.clock.nowSeconds());
+        int8[] blockBytes = null;
+        try {
+            blockBytes #= Base64.decode(block);
+        } catch (Base64Exception e) {
+            throw heap IdentityException(IdentityException.PROVIDER_ERROR(), "cognito",
+                "InitiateAuth", username, "the SECRET_BLOCK was not base64");
+        }
+        int8[] claim #= Srp.claim(key, this.poolName, userId, blockBytes, blockBytes.count(), ts);
+        String signature #= Base64.encode(claim, 32L);
+
+        CognitoJson r = heap CognitoJson();
+        r.str("ChallengeName", "PASSWORD_VERIFIER");
+        r.str("ClientId", cid);
+        r.open("ChallengeResponses");
+        r.str("USERNAME", internal);
+        r.str("PASSWORD_CLAIM_SECRET_BLOCK", block);
+        r.str("PASSWORD_CLAIM_SIGNATURE", signature);
+        r.str("TIMESTAMP", ts);
+        if (this.client.hasSecret()) {
+            String h #= this.client.secretHash(internal);
+            r.str("SECRET_HASH", h);
+        }
+        r.close();
+        String session #= CognitoClient.text(first, "Session");
+        if (session.byteLength() > 0) r.str("Session", session);
+        String answer #= r.done();
+        JsonValue second #= this.client.call("RespondToAuthChallenge", username, answer);
+        return this.outcome(second, internal);
+    }
+
+    private #SignInResult passwordSignIn(String username, String password) {
+        CognitoJson j = heap CognitoJson();
+        String cid #= this.client.appClientId();
+        j.str("AuthFlow", "USER_PASSWORD_AUTH");
+        j.str("ClientId", cid);
+        j.open("AuthParameters");
+        j.str("USERNAME", username);
+        j.str("PASSWORD", password);
+        if (this.client.hasSecret()) {
+            String h #= this.client.secretHash(username);
+            j.str("SECRET_HASH", h);
+        }
+        j.close();
+        String body #= j.done();
+        JsonValue r #= this.client.call("InitiateAuth", username, body);
+        return this.outcome(r, username);
+    }
+
+    // InvalidParameterException naming the SRP flow as not enabled.
+    private static boolean srpUnavailable(IdentityException e) {
+        if (e.kind() != IdentityException.POLICY_VIOLATION()) return false;
+        if (e.message.indexOf("InvalidParameterException") < 0L) return false;
+        return e.message.indexOf("USER_SRP_AUTH") >= 0L
+            || e.message.indexOf("not enabled") >= 0L
+            || e.message.indexOf("not supported") >= 0L;
+    }
+
+    public #SignInResult signInWith(String username, int32 factor) {
+        throw heap IdentityException(IdentityException.UNSUPPORTED_CAPABILITY(), "cognito",
+            "signInWith", username, "passwordless sign-in needs the USER_AUTH flow, which this adapter does not declare");
+    }
+
+    public #SignInResult respond(String session, int32 kind, ChallengeAnswer answer) {
+        String user #= CognitoAuthenticator.handlePart(session, 0);
+        String name #= CognitoAuthenticator.handlePart(session, 1);
+        String cognitoSession #= CognitoAuthenticator.handlePart(session, 2);
+        String cid #= this.client.appClientId();
+        String sessionToSend #= "" + cognitoSession;
+        if (name.equals("MFA_SETUP")) {
+            // The enrollment's session goes to VerifySoftwareToken with the
+            // first code, which returns the session that completes sign-in.
+            CognitoJson vj = heap CognitoJson();
+            vj.str("Session", cognitoSession);
+            String code #= answer.value();
+            vj.str("UserCode", code);
+            String vbody #= vj.done();
+            JsonValue verified #= this.client.call("VerifySoftwareToken", user, vbody);
+            sessionToSend #= CognitoClient.text(verified, "Session");
+        }
+        CognitoJson j = heap CognitoJson();
+        j.str("ChallengeName", name);
+        j.str("ClientId", cid);
+        j.open("ChallengeResponses");
+        j.str("USERNAME", user);
+        if (this.client.hasSecret()) {
+            String h #= this.client.secretHash(user);
+            j.str("SECRET_HASH", h);
+        }
+        String value #= answer.value();
+        if (name.equals("SOFTWARE_TOKEN_MFA") || name.equals("SMS_MFA") || name.equals("SMS_OTP")
+                || name.equals("EMAIL_OTP") || name.equals("EMAIL_MFA")) {
+            String field #= name + "_CODE";
+            j.str(field, value);
+        } else if (name.equals("NEW_PASSWORD_REQUIRED")) {
+            j.str("NEW_PASSWORD", value);
+            Attributes extra = answer.attributes();
+            for (int32 i = 0; i < extra.count(); i++) {
+                String an #= extra.nameAt(i);
+                String av #= extra.valueAt(i);
+                String field #= "userAttributes." + an;
+                j.str(field, av);
+            }
+        } else if (name.equals("SELECT_MFA_TYPE") || name.equals("SELECT_CHALLENGE")) {
+            String choice #= CognitoAuthenticator.factorName(answer.factor());
+            j.str("ANSWER", choice);
+        } else if (name.equals("CUSTOM_CHALLENGE")) {
+            j.str("ANSWER", value);
+        } else if (name.equals("WEB_AUTHN")) {
+            j.str("CREDENTIAL", value);
+        }
+        j.close();
+        if (sessionToSend.byteLength() > 0) j.str("Session", sessionToSend);
+        String body #= j.done();
+        JsonValue r #= this.client.call("RespondToAuthChallenge", user, body);
+        return this.outcome(r, user);
+    }
+
+    public #Tokens refresh(String refreshToken) {
+        CognitoJson j = heap CognitoJson();
+        String cid #= this.client.appClientId();
+        j.str("AuthFlow", "REFRESH_TOKEN_AUTH");
+        j.str("ClientId", cid);
+        j.open("AuthParameters");
+        j.str("REFRESH_TOKEN", refreshToken);
+        j.close();
+        String body #= j.done();
+        JsonValue r #= this.client.call("InitiateAuth", "-", body);
+        JsonValue result = r.object().get("AuthenticationResult");
+        if (result == null) {
+            throw heap IdentityException(IdentityException.PROVIDER_ERROR(), "cognito",
+                "refresh", "-", "REFRESH_TOKEN_AUTH answered without tokens");
+        }
+        return this.tokensOf(result, refreshToken);
+    }
+
+    public void signOut(String refreshToken) {
+        CognitoJson j = heap CognitoJson();
+        String cid #= this.client.appClientId();
+        j.str("Token", refreshToken);
+        j.str("ClientId", cid);
+        String body #= j.done();
+        JsonValue r #= this.client.call("RevokeToken", "-", body);
+    }
+
+    public void forgotPassword(String username) {
+        CognitoJson j = heap CognitoJson();
+        String cid #= this.client.appClientId();
+        j.str("ClientId", cid);
+        j.str("Username", username);
+        if (this.client.hasSecret()) {
+            String h #= this.client.secretHash(username);
+            j.str("SecretHash", h);
+        }
+        String body #= j.done();
+        JsonValue r #= this.client.call("ForgotPassword", username, body);
+    }
+
+    public void confirmForgotPassword(String username, String code, String newPassword) {
+        CognitoJson j = heap CognitoJson();
+        String cid #= this.client.appClientId();
+        j.str("ClientId", cid);
+        j.str("Username", username);
+        j.str("ConfirmationCode", code);
+        j.str("Password", newPassword);
+        if (this.client.hasSecret()) {
+            String h #= this.client.secretHash(username);
+            j.str("SecretHash", h);
+        }
+        String body #= j.done();
+        JsonValue r #= this.client.call("ConfirmForgotPassword", username, body);
+    }
+
+    public #TotpEnrollment enrollTotpForChallenge(String session) {
+        String user #= CognitoAuthenticator.handlePart(session, 0);
+        String cognitoSession #= CognitoAuthenticator.handlePart(session, 2);
+        CognitoJson j = heap CognitoJson();
+        j.str("Session", cognitoSession);
+        String body #= j.done();
+        JsonValue r #= this.client.call("AssociateSoftwareToken", user, body);
+        String secret #= CognitoClient.text(r, "SecretCode");
+        String next #= CognitoClient.text(r, "Session");
+        String handle #= CognitoAuthenticator.handle(user, "MFA_SETUP", next);
+        String uri #= "otpauth://totp/" + this.poolName + ":" + user + "?secret=" + secret
+            + "&issuer=" + this.poolName;
+        return heap TotpEnrollment(secret, uri, handle);
+    }
+
+    // Tokens, or the next challenge with a handle for respond().
+    private #SignInResult outcome(JsonValue r, String username) {
+        JsonValue result = r.object().get("AuthenticationResult");
+        if (result != null && result.kind() == JsonValue.OBJECT) {
+            Tokens t #= this.tokensOf(result, "");
+            return SignInResult.ofTokens(#t);
+        }
+        String name #= CognitoClient.text(r, "ChallengeName");
+        int32 kind = CognitoAuthenticator.kindOf(name);
+        if (kind < 0) {
+            throw heap IdentityException(IdentityException.PROVIDER_ERROR(), "cognito",
+                "signIn", username, "unexpected challenge " + name);
+        }
+        Attributes params = heap Attributes();
+        JsonValue p = r.object().get("ChallengeParameters");
+        if (p != null && p.kind() == JsonValue.OBJECT) {
+            JsonObject o = p.object();
+            for (int32 i = 0; i < o.count(); i++) {
+                String key #= JsonText.unescape(o.keyAt(i), o.keyLenAt(i));
+                String value #= CognitoClient.text(p, key);
+                params.set(key, value);
+            }
+        }
+        String session #= CognitoClient.text(r, "Session");
+        String handle #= CognitoAuthenticator.handle(username, name, session);
+        Challenge c = heap Challenge(kind, handle, #params);
+        if (kind == ChallengeKind.SELECT_FACTOR()) {
+            String choices #= c.parameter("MFAS_CAN_CHOOSE");
+            if (choices.indexOf("SOFTWARE_TOKEN_MFA") >= 0L) c.addOption(Factor.TOTP());
+            if (choices.indexOf("SMS") >= 0L) c.addOption(Factor.SMS_OTP());
+            if (choices.indexOf("EMAIL") >= 0L) c.addOption(Factor.EMAIL_OTP());
+        }
+        return SignInResult.ofChallenge(#c);
+    }
+
+    private #Tokens tokensOf(JsonValue result, String keepRefresh) {
+        String access #= CognitoClient.text(result, "AccessToken");
+        String id #= CognitoClient.text(result, "IdToken");
+        String refresh #= CognitoClient.text(result, "RefreshToken");
+        if (refresh.byteLength() == 0) refresh #= "" + keepRefresh;
+        int64 expiresIn = 3600L;
+        JsonValue e = result.object().get("ExpiresIn");
+        if (e != null && e.kind() == JsonValue.NUMBER) expiresIn = e.asInt64();
+        int64 exp = this.clock.nowSeconds() + expiresIn;
+        String sub = "";
+        if (id.byteLength() > 0) {
+            DecodedJwt d #= Jwt.decode(id, "cognito", "signIn");
+            Claims c #= d.claims();
+            sub #= c.subject();
+        }
+        return heap Tokens(access, id, refresh, exp, exp, 0L, sub);
+    }
+
+    private static int32 kindOf(String name) {
+        if (name.equals("SOFTWARE_TOKEN_MFA")) return ChallengeKind.TOTP();
+        if (name.equals("SMS_MFA") || name.equals("SMS_OTP")) return ChallengeKind.SMS_OTP();
+        if (name.equals("EMAIL_MFA") || name.equals("EMAIL_OTP")) return ChallengeKind.EMAIL_OTP();
+        if (name.equals("NEW_PASSWORD_REQUIRED")) return ChallengeKind.NEW_PASSWORD_REQUIRED();
+        if (name.equals("MFA_SETUP")) return ChallengeKind.MFA_SETUP();
+        if (name.equals("SELECT_MFA_TYPE") || name.equals("SELECT_CHALLENGE")) {
+            return ChallengeKind.SELECT_FACTOR();
+        }
+        if (name.equals("CUSTOM_CHALLENGE")) return ChallengeKind.CUSTOM();
+        if (name.equals("WEB_AUTHN")) return ChallengeKind.PASSKEY();
+        return -1;
+    }
+
+    private static #String factorName(int32 factor) {
+        if (factor == Factor.TOTP()) return "" + "SOFTWARE_TOKEN_MFA";
+        if (factor == Factor.SMS_OTP()) return "" + "SMS_MFA";
+        if (factor == Factor.EMAIL_OTP()) return "" + "EMAIL_OTP";
+        if (factor == Factor.PASSKEY()) return "" + "WEB_AUTHN";
+        return "" + "PASSWORD";
+    }
+
+    // handle = b64url(user) "." b64url(challenge name) "." Cognito's session
+    private static #String handle(String user, String name, String session) {
+        int8[] ub #= user.toBytes();
+        int8[] nb #= name.toBytes();
+        String u #= Base64.encodeUrlSafe(ub, (int64) user.byteLength());
+        String n #= Base64.encodeUrlSafe(nb, (int64) name.byteLength());
+        return u + "." + n + "." + session;
+    }
+
+    private static #String handlePart(String handle, int32 part) {
+        int64 a = handle.indexOf(".");
+        int64 b = -1L;
+        if (a > 0L) b = handle.indexOfFrom(".", a + 1L);
+        if (a <= 0L || b <= a + 1L) {
+            throw heap IdentityException(IdentityException.INVALID_CODE(), "cognito",
+                "respond", "-", "the session handle is not one this adapter issued");
+        }
+        if (part == 2) {
+            String rest #= handle.substring((int32) (b + 1L), handle.byteLength());
+            return #rest;
+        }
+        String seg = null;
+        if (part == 0) seg #= handle.substring(0, (int32) a);
+        else seg #= handle.substring((int32) (a + 1L), (int32) b);
+        try {
+            int8[] bytes #= Base64.decode(seg);
+            int32 n = (int32) bytes.count();
+            return heap String(#bytes, n);
+        } catch (Base64Exception e) {
+            throw heap IdentityException(IdentityException.INVALID_CODE(), "cognito",
+                "respond", "-", "the session handle is not one this adapter issued");
+        }
+        return "";
+    }
+}

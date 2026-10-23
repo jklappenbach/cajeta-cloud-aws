@@ -1,0 +1,43 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+
+/**
+ * The TIMESTAMP of a PASSWORD_VERIFIER response, as Cognito parses it:
+ * `EEE MMM d HH:mm:ss UTC yyyy` in UTC, the day of the month not
+ * zero-padded (`Thu Mar 5 07:04:09 UTC 2026`).
+ */
+public final class CognitoTime {
+    private static final String DAYS = "SunMonTueWedThuFriSat";
+    private static final String MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+    public static #String timestamp(int64 epochSeconds) {
+        int64 days = epochSeconds / 86400L;
+        int64 secs = epochSeconds - days * 86400L;
+        // 1970-01-01 was a Thursday (index 4).
+        int32 dow = (int32) ((days + 4L) % 7L);
+        // Hinnant's civil_from_days.
+        int64 z = days + 719468L;
+        int64 era = z / 146097L;
+        int64 doe = z - era * 146097L;
+        int64 yoe = (doe - doe / 1460L + doe / 36524L - doe / 146096L) / 365L;
+        int64 y = yoe + era * 400L;
+        int64 doy = doe - (365L * yoe + yoe / 4L - yoe / 100L);
+        int64 mp = (5L * doy + 2L) / 153L;
+        int64 d = doy - (153L * mp + 2L) / 5L + 1L;
+        int64 m = mp < 10L ? mp + 3L : mp - 9L;
+        if (m <= 2L) y = y + 1L;
+        String day #= CognitoTime.DAYS.substring(dow * 3, dow * 3 + 3);
+        int32 mi = (int32) (m - 1L);
+        String month #= CognitoTime.MONTHS.substring(mi * 3, mi * 3 + 3);
+        String hh #= CognitoTime.two(secs / 3600L);
+        String mm #= CognitoTime.two((secs / 60L) % 60L);
+        String ss #= CognitoTime.two(secs % 60L);
+        return day + " " + month + " " + d + " " + hh + ":" + mm + ":" + ss + " UTC " + y;
+    }
+
+    private static #String two(int64 v) {
+        if (v < 10L) return "0" + v;
+        return "" + v;
+    }
+}

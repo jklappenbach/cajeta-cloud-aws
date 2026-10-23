@@ -1,0 +1,212 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.codec.Base64;
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.cloud.aws.CognitoClient;
+import dev.cajeta.cloud.aws.CognitoReply;
+import dev.cajeta.cloud.aws.CognitoTransport;
+import dev.cajeta.crypto.HmacSha256;
+import dev.cajeta.crypto.Sha256;
+import dev.cajeta.crypto.Srp;
+
+/**
+ * A cognito-idp double that plays the server side of USER_SRP_AUTH for one
+ * user, and answers every other call from a script. On InitiateAuth with
+ * USER_SRP_AUTH it holds the user's verifier v = g^x and answers
+ * PASSWORD_VERIFIER with B = k*v + g^b; on the PASSWORD_VERIFIER response it
+ * derives the password key from its own premaster (A*v^u)^b and checks the
+ * claim, answering NotAuthorizedException when it does not match, else the
+ * next scripted reply. The derivation here (x, k, u, the padding, HKDF) is
+ * written independently of the client's, from pycognito's aws_srp.
+ */
+public final class FakeCognito implements CognitoTransport {
+    private static final String SALT = "c3f1a2b4d5e6f708192a3b4c5d6e7f80";
+    private static final String B_SECRET =
+        "878485dd8790516301addc9db563b57166c33804b66be6605255b801c788b062";
+    private static final String SECRET_BLOCK = "c2VjcmV0LWJsb2NrLWZvci10aGUtZmFrZQ==";
+
+    String poolName;
+    String userId;
+    String n;
+    String k;
+    String v;
+    String clientA;
+    String serverB;
+    ArrayList<String> replyBodies;
+    ArrayList<int32> replyStatus;
+    ArrayList<String> ops;
+    ArrayList<String> bodies;
+    int32 next;
+    public int32 claimsChecked;
+
+    public FakeCognito(String poolName, String userIdForSrp, String password) {
+        this.poolName = "" + poolName;
+        this.userId = "" + userIdForSrp;
+        this.n #= Srp.cognitoPrimeHex();
+        int8[] nb #= FakeCognito.hexBytes(this.n);
+        int8[] two = heap int8[1];
+        two[0] = (int8) 2;
+        this.k #= FakeCognito.sha256Hex(FakeCognito.cat(FakeCognito.pad(nb), FakeCognito.pad(two)));
+        String identity #= poolName + userIdForSrp + ":" + password;
+        int8[] ib #= identity.toBytes();
+        int8[] inner #= Sha256.hash(ib, (int64) identity.byteLength());
+        int8[] salt #= FakeCognito.hexBytes("00" + FakeCognito.SALT);
+        String x #= FakeCognito.sha256Hex(FakeCognito.cat(salt, inner));
+        this.v #= Srp.modPowHex("2", x, this.n);
+        this.clientA = "";
+        this.serverB = "";
+        this.replyBodies = heap ArrayList<String>();
+        this.replyStatus = heap ArrayList<int32>();
+        this.ops = heap ArrayList<String>();
+        this.bodies = heap ArrayList<String>();
+        this.next = 0;
+        this.claimsChecked = 0;
+        return;
+    }
+
+    public void reply(int32 status, String body) {
+        String b = "" + body;
+        this.replyBodies.add(#b);
+        this.replyStatus.add(status);
+        return;
+    }
+
+    public void error(String type, String message) {
+        this.reply(400, "{\"__type\":\"" + type + "\",\"message\":\"" + message + "\"}");
+        return;
+    }
+
+    public void tokens(String access, String id, String refresh) {
+        String r = "";
+        if (refresh != null) r = ",\"RefreshToken\":\"" + refresh + "\"";
+        this.reply(200, "{\"AuthenticationResult\":{\"AccessToken\":\"" + access
+            + "\",\"ExpiresIn\":3600,\"IdToken\":\"" + id + "\"" + r
+            + ",\"TokenType\":\"Bearer\"},\"ChallengeParameters\":{}}");
+        return;
+    }
+
+    public int32 calls() { return this.ops.count(); }
+    public String opAt(int32 i) { return this.ops.get(i); }
+    public String bodyAt(int32 i) { return this.bodies.get(i); }
+
+    /** True when no request body so far contains `text`. */
+    public boolean neverSent(String text) {
+        for (int32 i = 0; i < this.bodies.count(); i++) {
+            if (this.bodies.get(i).indexOf(text) >= 0L) return false;
+        }
+        return true;
+    }
+
+    public #CognitoReply send(String operation, String body, boolean signed) {
+        String o = "" + operation;
+        String b = "" + body;
+        this.ops.add(#o);
+        this.bodies.add(#b);
+        JsonValue req #= Json.parse(body);
+        String flow #= CognitoClient.text(req, "AuthFlow");
+        String challenge #= CognitoClient.text(req, "ChallengeName");
+        if (operation.equals("InitiateAuth") && flow.equals("USER_SRP_AUTH")) {
+            JsonValue params = req.object().get("AuthParameters");
+            this.clientA #= CognitoClient.text(params, "SRP_A");
+            this.serverB #= Srp.serverPublicHex(this.n, "2", this.k, this.v, FakeCognito.B_SECRET);
+            return heap CognitoReply(200, "{\"ChallengeName\":\"PASSWORD_VERIFIER\","
+                + "\"ChallengeParameters\":{\"SALT\":\"" + FakeCognito.SALT + "\",\"SECRET_BLOCK\":\""
+                + FakeCognito.SECRET_BLOCK + "\",\"SRP_B\":\"" + this.serverB
+                + "\",\"USERNAME\":\"" + this.userId + "\",\"USER_ID_FOR_SRP\":\"" + this.userId + "\"}}");
+        }
+        if (operation.equals("RespondToAuthChallenge") && challenge.equals("PASSWORD_VERIFIER")) {
+            JsonValue answers = req.object().get("ChallengeResponses");
+            String sig #= CognitoClient.text(answers, "PASSWORD_CLAIM_SIGNATURE");
+            String ts #= CognitoClient.text(answers, "TIMESTAMP");
+            String block #= CognitoClient.text(answers, "PASSWORD_CLAIM_SECRET_BLOCK");
+            this.claimsChecked = this.claimsChecked + 1;
+            if (!block.equals(FakeCognito.SECRET_BLOCK) || !this.claimMatches(sig, ts)) {
+                return heap CognitoReply(400,
+                    "{\"__type\":\"NotAuthorizedException\",\"message\":\"Incorrect username or password.\"}");
+            }
+        }
+        int32 i = this.next;
+        this.next = this.next + 1;
+        if (i >= this.replyBodies.count()) {
+            return heap CognitoReply(500, "{\"__type\":\"ScriptExhausted\",\"message\":\"no scripted reply\"}");
+        }
+        return heap CognitoReply(this.replyStatus.get(i), this.replyBodies.get(i));
+    }
+
+    // The server's view of the claim: key = HKDF(pad(S), pad(u)), then HMAC.
+    private boolean claimMatches(String signatureB64, String timestamp) {
+        int8[] a #= FakeCognito.hexBytes(this.clientA);
+        int8[] b #= FakeCognito.hexBytes(this.serverB);
+        String u #= FakeCognito.sha256Hex(FakeCognito.cat(FakeCognito.pad(a), FakeCognito.pad(b)));
+        String s #= Srp.serverPremasterHex(this.n, this.clientA, this.v, u, FakeCognito.B_SECRET);
+        int8[] ub #= FakeCognito.hexBytes(u);
+        int8[] sb #= FakeCognito.hexBytes(s);
+        int8[] up #= FakeCognito.pad(ub);
+        int8[] sp #= FakeCognito.pad(sb);
+        int8[] prk #= HmacSha256.mac(up, up.count(), sp, sp.count());
+        String label = "Caldera Derived Key";
+        int8[] info = heap int8[label.byteLength() + 1];
+        for (int32 i = 0; i < label.byteLength(); i++) info[i] = label.byteAt(i);
+        info[label.byteLength()] = (int8) 1;
+        int8[] okm #= HmacSha256.mac(prk, 32L, info, info.count());
+        int8[] key = heap int8[16];
+        for (int32 i = 0; i < 16; i++) key[i] = okm[i];
+        int8[] blockBytes #= Base64.decode(FakeCognito.SECRET_BLOCK);
+        String msg #= this.poolName + this.userId;
+        int8[] head #= msg.toBytes();
+        int8[] tsb #= timestamp.toBytes();
+        HmacSha256 m = heap HmacSha256(key, 16L);
+        m.update(head, (int64) msg.byteLength());
+        m.update(blockBytes, blockBytes.count());
+        m.update(tsb, (int64) timestamp.byteLength());
+        int8[] want #= m.digest();
+        String wantB64 #= Base64.encode(want, 32L);
+        return wantB64.equals(signatureB64);
+    }
+
+    // Minimal magnitude, then a 00 byte in front when the top bit is set.
+    static #int8[] pad(int8[] v) {
+        int64 n = v.count();
+        int64 at = 0L;
+        while (at < n - 1L && v[at] == (int8) 0) at = at + 1L;
+        int64 len = n - at;
+        int64 extra = 0L;
+        if ((((int32) v[at]) & 0x80) != 0) extra = 1L;
+        int8[] out = heap int8[len + extra];
+        for (int64 i = 0L; i < len; i++) out[extra + i] = v[at + i];
+        return #out;
+    }
+
+    static #int8[] cat(int8[] a, int8[] b) {
+        int64 an = a.count();
+        int64 bn = b.count();
+        int8[] out = heap int8[an + bn];
+        for (int64 i = 0L; i < an; i++) out[i] = a[i];
+        for (int64 i = 0L; i < bn; i++) out[an + i] = b[i];
+        return #out;
+    }
+
+    static #String sha256Hex(int8[] data) {
+        return Sha256.hashHex(data, data.count());
+    }
+
+    static #int8[] hexBytes(String hex) {
+        String h #= "" + hex;
+        if (hex.byteLength() % 2 == 1) h #= "0" + hex;
+        int32 n = h.byteLength() / 2;
+        int8[] out = heap int8[n < 1 ? 1 : n];
+        for (int32 i = 0; i < n; i++) {
+            out[i] = (int8) ((FakeCognito.nyb(h.byteAt(2 * i)) << 4) | FakeCognito.nyb(h.byteAt(2 * i + 1)));
+        }
+        return #out;
+    }
+
+    static int32 nyb(int8 c) {
+        if (c >= (int8) 48 && c <= (int8) 57) return (int32) c - 48;
+        if (c >= (int8) 97 && c <= (int8) 102) return (int32) c - 87;
+        return (int32) c - 55;
+    }
+}
