@@ -1,0 +1,81 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.codec.json.JsonValue;
+import cajeta.lang.String;
+
+/**
+ * What a pool and app client allow, which decides the adapter's capabilities
+ * (identity spec §8, §14.9): the MFA mode (`OFF`, `ON`, `OPTIONAL`) and which
+ * factors are configured, whether the app client revokes tokens, and whether
+ * AWS credentials reach the administrative plane. `discover` reads them with
+ * two signed calls; `unreadable` stands in when there are no credentials.
+ */
+public final class CognitoPoolSettings {
+    String mfa;
+    boolean totp;
+    boolean sms;
+    boolean email;
+    boolean revocation;
+    boolean admin;
+    boolean known;
+
+    public CognitoPoolSettings(String mfaMode, boolean totp, boolean sms, boolean email,
+                               boolean revocation, boolean admin) {
+        this.mfa = "" + mfaMode;
+        boolean on = !mfaMode.equals("OFF");
+        this.totp = on && totp;
+        this.sms = on && sms;
+        this.email = on && email;
+        this.revocation = revocation;
+        this.admin = admin;
+        this.known = true;
+        return;
+    }
+
+    /**
+     * No credentials, so the pool's configuration cannot be read: the
+     * factors and revocation are declared with a caveat saying so, and the
+     * administrative plane is not declared.
+     */
+    public static #CognitoPoolSettings unreadable() {
+        CognitoPoolSettings s = heap CognitoPoolSettings("OPTIONAL", true, true, true, true, false);
+        s.known = false;
+        return #s;
+    }
+
+    /** GetUserPoolMfaConfig and DescribeUserPoolClient, both signed. */
+    public static #CognitoPoolSettings discover(CognitoClient client, String userPoolId) {
+        CognitoJson j = heap CognitoJson();
+        j.str("UserPoolId", userPoolId);
+        String body #= j.done();
+        JsonValue m #= client.admin("GetUserPoolMfaConfig", userPoolId, body);
+        String mode #= CognitoClient.text(m, "MfaConfiguration");
+        if (mode.byteLength() == 0) mode #= "" + "OFF";
+        boolean totp = false;
+        JsonValue st = m.object().get("SoftwareTokenMfaConfiguration");
+        if (st != null && st.kind() == JsonValue.OBJECT) {
+            JsonValue en = st.object().get("Enabled");
+            totp = en != null && en.kind() == JsonValue.BOOLEAN && en.asBoolean();
+        }
+        JsonValue smsCfg = m.object().get("SmsMfaConfiguration");
+        boolean sms = smsCfg != null && smsCfg.kind() == JsonValue.OBJECT;
+        JsonValue emailCfg = m.object().get("EmailMfaConfiguration");
+        boolean email = emailCfg != null && emailCfg.kind() == JsonValue.OBJECT;
+
+        CognitoJson c = heap CognitoJson();
+        c.str("UserPoolId", userPoolId);
+        String cid #= client.appClientId();
+        c.str("ClientId", cid);
+        String cbody #= c.done();
+        JsonValue d #= client.admin("DescribeUserPoolClient", userPoolId, cbody);
+        boolean revoke = false;
+        JsonValue upc = d.object().get("UserPoolClient");
+        if (upc != null && upc.kind() == JsonValue.OBJECT) {
+            JsonValue r = upc.object().get("EnableTokenRevocation");
+            revoke = r != null && r.kind() == JsonValue.BOOLEAN && r.asBoolean();
+        }
+        return heap CognitoPoolSettings(mode, totp, sms, email, revoke, true);
+    }
+
+    public boolean readable() { return this.known; }
+}

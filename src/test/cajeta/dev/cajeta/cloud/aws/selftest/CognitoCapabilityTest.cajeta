@@ -1,0 +1,138 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.identity.IdentityCapability;
+import dev.cajeta.cloud.identity.IdentitySelector;
+import dev.cajeta.cloud.aws.AwsConfigurationException;
+import dev.cajeta.cloud.aws.CognitoClient;
+import dev.cajeta.cloud.aws.CognitoPoolSettings;
+import dev.cajeta.cloud.aws.CognitoUserPool;
+
+/**
+ * Capabilities follow the pool's configuration (plan 3.1.3, identity spec
+ * §8 and §14.9), and `cognito` is a selectable provider (plan 3.1.4,
+ * identity spec §9.2).
+ */
+public class CognitoCapabilityTest {
+
+    public CognitoCapabilityTest() {
+        return;
+    }
+
+    @Test
+    public void aPoolWithoutMfaDeclaresNoTotpAndTheLaunchCheckNamesIt() {
+        // MFA off: no factor is declared even where one is configured.
+        CognitoPoolSettings s = heap CognitoPoolSettings("OFF", true, true, true, false, true);
+        Capabilities c #= CognitoUserPool.capabilitiesFor(s);
+        Assert.isFalse(c.supports(IdentityCapability.TOTP()));
+        Assert.isFalse(c.supports(IdentityCapability.SMS_OTP()));
+        Assert.isFalse(c.supports(IdentityCapability.EMAIL_OTP()));
+        Assert.isTrue(c.supports(IdentityCapability.CONFIRMATION()));
+        Assert.isTrue(c.supports(IdentityCapability.JWKS()));
+        String[] needed = [IdentityCapability.CONFIRMATION(), IdentityCapability.TOTP()];
+        String message = "";
+        try {
+            c.assertAll(needed);
+        } catch (CloudException e) {
+            message = "" + e.message;
+        }
+        Assert.isTrue(message.indexOf("identity.totp") >= 0L);
+        Assert.isTrue(message.indexOf("identity.confirmation") < 0L);
+        return;
+    }
+
+    @Test
+    public void anOptionalTotpPoolWithRevocationAndCredentials() {
+        CognitoPoolSettings s = heap CognitoPoolSettings("OPTIONAL", true, false, false, true, true);
+        Capabilities c #= CognitoUserPool.capabilitiesFor(s);
+        Assert.isTrue(c.supports(IdentityCapability.TOTP()));
+        Assert.isFalse(c.supports(IdentityCapability.SMS_OTP()));
+        Assert.isFalse(c.supports(IdentityCapability.EMAIL_OTP()));
+        Assert.isTrue(c.supports(IdentityCapability.REVOCATION()));
+        Assert.isTrue(c.supports(IdentityCapability.GROUPS()));
+        Assert.isTrue(c.supports(IdentityCapability.ADMIN()));
+        Assert.isFalse(c.supports(IdentityCapability.INTROSPECTION()));
+        Assert.isFalse(c.supports(IdentityCapability.PASSKEYS()));
+        return;
+    }
+
+    @Test
+    public void withoutCredentialsTheAdminPlaneIsNotDeclared() {
+        CognitoPoolSettings s #= CognitoPoolSettings.unreadable();
+        Capabilities c #= CognitoUserPool.capabilitiesFor(s);
+        Assert.isFalse(c.supports(IdentityCapability.GROUPS()));
+        Assert.isFalse(c.supports(IdentityCapability.ADMIN()));
+        Assert.isTrue(c.supports(IdentityCapability.TOTP()));
+        String why #= c.caveatFor(IdentityCapability.TOTP());
+        Assert.isTrue(why.indexOf("could not be read") >= 0L);
+        return;
+    }
+
+    @Test
+    public void discoveryReadsTheMfaAndClientConfiguration() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.reply(200, "{\"MfaConfiguration\":\"OPTIONAL\",\"SoftwareTokenMfaConfiguration\":{\"Enabled\":true},"
+            + "\"SmsMfaConfiguration\":{\"SmsAuthenticationMessage\":\"Your code is {####}\"}}");
+        t.reply(200, "{\"UserPoolClient\":{\"ClientId\":\"3n4b5urk1ft4fl3mg5e62d9ado\",\"EnableTokenRevocation\":false,"
+            + "\"ExplicitAuthFlows\":[\"ALLOW_USER_SRP_AUTH\",\"ALLOW_REFRESH_TOKEN_AUTH\"]}}");
+        CognitoClient client = heap CognitoClient("us-east-1", "3n4b5urk1ft4fl3mg5e62d9ado", null, t);
+        CognitoPoolSettings s #= CognitoPoolSettings.discover(client, "us-east-1_ExAmPlE12");
+        Capabilities c #= CognitoUserPool.capabilitiesFor(s);
+        Assert.isTrue(c.supports(IdentityCapability.TOTP()));
+        Assert.isTrue(c.supports(IdentityCapability.SMS_OTP()));
+        Assert.isFalse(c.supports(IdentityCapability.EMAIL_OTP()));
+        Assert.isFalse(c.supports(IdentityCapability.REVOCATION()));
+        Assert.equals("GetUserPoolMfaConfig", t.opAt(0));
+        Assert.equals("DescribeUserPoolClient", t.opAt(1));
+        Assert.isTrue(t.signedAt(0) && t.signedAt(1));
+        return;
+    }
+
+    @Test
+    public void cognitoIsSelectableByName() {
+        String[] present = ["memory", "cognito"];
+        String chosen #= IdentitySelector.decide(present, "cognito", false);
+        Assert.equals("cognito", chosen);
+        return;
+    }
+
+    @Test
+    public void theComponentNamesWhatItsConfigurationLacks() {
+        String pool = System.env.get("COGNITO_USER_POOL_ID");
+        System.env.set("COGNITO_USER_POOL_ID", "");
+        System.env.set("COGNITO_CLIENT_ID", "");
+        CognitoUserPool p = heap CognitoUserPool();
+        String message = "";
+        try {
+            Capabilities c = p.capabilities();
+        } catch (AwsConfigurationException e) {
+            message = "" + e.message;
+        }
+        Assert.isTrue(message.indexOf("COGNITO_USER_POOL_ID") >= 0L);
+        Assert.isTrue(message.indexOf("COGNITO_CLIENT_ID") >= 0L);
+        return;
+    }
+
+    @Test
+    public void theComponentWithoutCredentialsMakesNoAdminCall() {
+        System.env.set("COGNITO_USER_POOL_ID", "us-east-1_ExAmPlE12");
+        System.env.set("COGNITO_CLIENT_ID", "3n4b5urk1ft4fl3mg5e62d9ado");
+        System.env.set("AWS_REGION", "us-east-1");
+        System.env.set("AWS_ACCESS_KEY_ID", "");
+        System.env.set("AWS_SECRET_ACCESS_KEY", "");
+        System.env.set("AWS_PROFILE", "");
+        System.env.set("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/cajeta-aws/credentials");
+        CognitoUserPool p = heap CognitoUserPool();
+        Capabilities c = p.capabilities();
+        Assert.isFalse(c.supports(IdentityCapability.ADMIN()));
+        String name #= c.adapterName();
+        Assert.equals("cognito", name);
+        System.env.set("COGNITO_USER_POOL_ID", "");
+        System.env.set("COGNITO_CLIENT_ID", "");
+        System.env.set("AWS_REGION", "");
+        return;
+    }
+}

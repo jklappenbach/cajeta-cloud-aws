@@ -1,0 +1,34 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Skip;
+import dev.cajeta.cloud.testkit.IdentityContract;
+import dev.cajeta.cloud.aws.CognitoUserPool;
+
+/**
+ * The identity conformance suite against a real user pool (plan 3.1.5),
+ * opt-in: it runs when CAJETA_AWS_TEST_POOL and CAJETA_AWS_TEST_CLIENT name a
+ * pool and app client, with the region and credentials of the AWS chain, and
+ * is skipped otherwise. A real pool cannot hand over delivered codes or move
+ * time, so the suite's sections that need either are skipped by the testkit.
+ */
+public class CognitoConformanceTest {
+
+    public CognitoConformanceTest() {
+        return;
+    }
+
+    @Test
+    public void theIdentityContractHoldsAgainstARealPool() {
+        String pool = System.env.get("CAJETA_AWS_TEST_POOL");
+        String client = System.env.get("CAJETA_AWS_TEST_CLIENT");
+        if (pool == null || pool.byteLength() == 0 || client == null || client.byteLength() == 0) {
+            Skip.because("CAJETA_AWS_TEST_POOL and CAJETA_AWS_TEST_CLIENT are not set; no AWS pool to test against");
+        }
+        System.env.set("COGNITO_USER_POOL_ID", pool);
+        System.env.set("COGNITO_CLIENT_ID", client);
+        CognitoUserPool p = heap CognitoUserPool();
+        IdentityContract.verify(p, null, "cajeta-conformance-");
+        return;
+    }
+}

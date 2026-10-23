@@ -12,6 +12,7 @@ import dev.cajeta.cloud.identity.IdentityCapability;
 import dev.cajeta.cloud.identity.IdentityException;
 import dev.cajeta.cloud.identity.Jwt;
 import dev.cajeta.cloud.identity.RegistrationResult;
+import dev.cajeta.cloud.identity.SystemTimeSource;
 import dev.cajeta.cloud.identity.TimeSource;
 import dev.cajeta.cloud.identity.TokenVerifier;
 import dev.cajeta.cloud.identity.User;
@@ -24,49 +25,143 @@ import dev.cajeta.cloud.identity.UserPool;
  * administrative plane, SigV4-signed, keyed by subject: the adapter finds the
  * username with `ListUsers` filtered on `sub` (eventually consistent, so a
  * user registered a moment ago may not be found yet).
+ *
+ * As the `cognito` component it configures itself on first use from
+ * COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID and the optional
+ * COGNITO_CLIENT_SECRET, the region of the AWS chain, and the chain's
+ * credentials when it has any. With credentials it reads the pool's MFA and
+ * app client configuration once and declares exactly what they grant
+ * (§14.9); without them it declares the user plane only, factors carrying a
+ * caveat. Construction does nothing, so a program that selects another
+ * provider never touches AWS.
  */
+@Component(name = "cognito")
 public final class CognitoUserPool implements UserPool {
     CognitoClient client;
+    CognitoTransport transport;
     String poolId;
     TimeSource clock;
     CognitoAuthenticator auth;
     CognitoAccount acct;
     CognitoTokenVerifier ver;
     Capabilities caps;
+    boolean ready;
 
-    CognitoUserPool(int32 bare) { return; }
+    /** The `cognito` component: configured from the environment on first use. */
+    public CognitoUserPool() {
+        this.ready = false;
+        return;
+    }
 
-    /** A pool over the given client; the token verifier fetches the pool's JWKS over HTTPS. */
+    CognitoUserPool(int32 bare) {
+        this.ready = false;
+        return;
+    }
+
+    /** A pool over the given client, declaring as for unreadable settings. */
     public static #CognitoUserPool over(#CognitoClient client, String userPoolId, #TimeSource clock) {
+        CognitoPoolSettings s #= CognitoPoolSettings.unreadable();
         CognitoUserPool p = heap CognitoUserPool(0);
         p.client #= client;
-        p.poolId = "" + userPoolId;
         p.clock #= clock;
-        p.auth = heap CognitoAuthenticator(p.client, userPoolId, p.clock);
-        p.acct = heap CognitoAccount(p.client, userPoolId);
-        String region #= p.client.regionName();
-        String cid #= p.client.appClientId();
-        String url #= CognitoTokenVerifier.jwksUrlFor(region, userPoolId);
-        JwksSource keys = heap HttpJwksSource(url);
-        p.ver = heap CognitoTokenVerifier(region, userPoolId, cid, #keys, p.clock);
-        Capabilities c = heap Capabilities("cognito");
-        c.declare(IdentityCapability.CONFIRMATION(), "");
-        c.declare(IdentityCapability.CUSTOM_ATTRIBUTES(), "sent as custom:<name>; the pool must define each one");
-        c.declare(IdentityCapability.TOTP(), "");
-        c.declare(IdentityCapability.REFRESH(), "");
-        c.declare(IdentityCapability.JWKS(), "");
-        c.declare(IdentityCapability.PASSWORD_RESET(), "");
-        c.declare(IdentityCapability.REVOCATION(), "the app client must enable token revocation");
-        c.declare(IdentityCapability.GROUPS(), "needs AWS credentials");
-        c.declare(IdentityCapability.ADMIN(), "needs AWS credentials");
-        p.caps #= c;
+        p.init(userPoolId, s);
         return #p;
     }
 
-    public Capabilities capabilities() { return this.caps; }
-    public Authenticator authenticator() { return this.auth; }
-    public Account account() { return this.acct; }
-    public TokenVerifier verifier() { return this.ver; }
+    /** A pool over the given client, declaring what `settings` grant. */
+    public static #CognitoUserPool overSettings(#CognitoClient client, String userPoolId,
+                                                #TimeSource clock, CognitoPoolSettings settings) {
+        CognitoUserPool p = heap CognitoUserPool(0);
+        p.client #= client;
+        p.clock #= clock;
+        p.init(userPoolId, settings);
+        return #p;
+    }
+
+    // Wires the planes once client and clock are set.
+    private void init(String userPoolId, CognitoPoolSettings settings) {
+        this.poolId = "" + userPoolId;
+        this.auth = heap CognitoAuthenticator(this.client, userPoolId, this.clock);
+        this.acct = heap CognitoAccount(this.client, userPoolId);
+        String region #= this.client.regionName();
+        String cid #= this.client.appClientId();
+        String url #= CognitoTokenVerifier.jwksUrlFor(region, userPoolId);
+        JwksSource keys = heap HttpJwksSource(url);
+        this.ver = heap CognitoTokenVerifier(region, userPoolId, cid, #keys, this.clock);
+        this.caps #= CognitoUserPool.capabilitiesFor(settings);
+        this.ready = true;
+    }
+
+    // The component path: read the configuration, build the HTTPS transport.
+    private void ensure() {
+        if (this.ready) return;
+        String pool #= CognitoUserPool.env("COGNITO_USER_POOL_ID");
+        String cid #= CognitoUserPool.env("COGNITO_CLIENT_ID");
+        if (pool == null || cid == null) {
+            String missing = "";
+            if (pool == null) missing = "COGNITO_USER_POOL_ID";
+            if (cid == null) {
+                if (missing.byteLength() > 0) missing = missing + " and ";
+                missing = missing + "COGNITO_CLIENT_ID";
+            }
+            throw heap AwsConfigurationException("the cognito identity adapter needs the user pool id "
+                + "and app client id; not set: " + missing);
+        }
+        String secret #= CognitoUserPool.env("COGNITO_CLIENT_SECRET");
+        String region #= CredentialChain.region(null);
+        AwsCredentials creds = null;
+        try {
+            creds #= CredentialChain.resolve(null);
+        } catch (AwsConfigurationException e) {
+            creds = null;
+        }
+        boolean admin = creds != null;
+        this.clock = heap SystemTimeSource();
+        this.transport = heap HttpCognitoTransport(region, #creds, this.clock);
+        this.client = heap CognitoClient(region, cid, secret, this.transport);
+        CognitoPoolSettings s = null;
+        if (admin) {
+            s #= CognitoPoolSettings.discover(this.client, pool);
+        } else {
+            s #= CognitoPoolSettings.unreadable();
+        }
+        this.init(pool, s);
+    }
+
+    private static #String env(String name) {
+        String v #= System.env.get(name);
+        if (v == null || v.byteLength() == 0) return null;
+        return #v;
+    }
+
+    /** The capabilities a pool with `settings` declares (§8, §14.9). */
+    public static #Capabilities capabilitiesFor(CognitoPoolSettings settings) {
+        Capabilities c = heap Capabilities("cognito");
+        String note = "";
+        if (!settings.readable()) {
+            note = "the pool's configuration could not be read without AWS credentials; "
+                + "a factor or revocation the pool does not enable fails as unsupported-capability";
+        }
+        c.declare(IdentityCapability.CONFIRMATION(), "");
+        c.declare(IdentityCapability.CUSTOM_ATTRIBUTES(), "sent as custom:<name>; the pool must define each one");
+        c.declare(IdentityCapability.REFRESH(), "");
+        c.declare(IdentityCapability.JWKS(), "");
+        c.declare(IdentityCapability.PASSWORD_RESET(), "");
+        if (settings.totp) c.declare(IdentityCapability.TOTP(), note);
+        if (settings.sms) c.declare(IdentityCapability.SMS_OTP(), note);
+        if (settings.email) c.declare(IdentityCapability.EMAIL_OTP(), note);
+        if (settings.revocation) c.declare(IdentityCapability.REVOCATION(), note);
+        if (settings.admin) {
+            c.declare(IdentityCapability.GROUPS(), "");
+            c.declare(IdentityCapability.ADMIN(), "");
+        }
+        return #c;
+    }
+
+    public Capabilities capabilities() { this.ensure(); return this.caps; }
+    public Authenticator authenticator() { this.ensure(); return this.auth; }
+    public Account account() { this.ensure(); return this.acct; }
+    public TokenVerifier verifier() { this.ensure(); return this.ver; }
 
     public #RegistrationResult register(String username, String password) {
         Attributes none = heap Attributes();
@@ -74,6 +169,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     public #RegistrationResult registerWith(String username, String password, Attributes attributes) {
+        this.ensure();
         CognitoJson j = heap CognitoJson();
         String cid #= this.client.appClientId();
         j.str("ClientId", cid);
@@ -100,6 +196,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     public void confirm(String username, String code) {
+        this.ensure();
         CognitoJson j = heap CognitoJson();
         String cid #= this.client.appClientId();
         j.str("ClientId", cid);
@@ -114,6 +211,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     public #User lookupBySubject(String subject) {
+        this.ensure();
         JsonValue r #= this.findBySubject(subject, "lookupBySubject");
         if (r == null) CognitoUserPool.notFound("lookupBySubject", subject);
         JsonValue found = CognitoUserPool.first(r);
@@ -124,6 +222,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     public #User lookupByName(String username) {
+        this.ensure();
         String body #= this.userBody(username);
         JsonValue r #= this.client.admin("AdminGetUser", username, body);
         String name #= CognitoClient.text(r, "Username");
@@ -133,6 +232,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     public boolean delete(String subject) {
+        this.ensure();
         JsonValue r0 #= this.findBySubject(subject, "delete");
         if (r0 == null) return false;
         JsonValue found = CognitoUserPool.first(r0);
@@ -143,6 +243,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     public void setAttribute(String subject, String name, String value) {
+        this.ensure();
         String user #= this.usernameOf(subject, "setAttribute");
         CognitoJson j = heap CognitoJson();
         j.str("UserPoolId", this.poolId);
@@ -154,6 +255,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     public void removeAttribute(String subject, String name) {
+        this.ensure();
         String user #= this.usernameOf(subject, "removeAttribute");
         String wire #= CognitoAttributes.wireName(name);
         String quoted #= Jwt.quote(wire);
@@ -174,6 +276,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     public #String[] groups(String subject) {
+        this.ensure();
         String user #= this.usernameOf(subject, "groups");
         ArrayList<String> names #= this.groupsOf(user, subject);
         int32 n = names.count();
@@ -186,6 +289,7 @@ public final class CognitoUserPool implements UserPool {
     }
 
     private void groupCall(String operation, String subject, String group) {
+        this.ensure();
         String user #= this.usernameOf(subject, operation);
         CognitoJson j = heap CognitoJson();
         j.str("UserPoolId", this.poolId);
