@@ -9,8 +9,8 @@
 #   git checkout release && git merge --ff-only main && git push origin release
 #   git tag v<version> && git push origin v<version>
 #
-# No test reaches AWS. The real-service conformance legs (spec §2.5) will be a
-# separate opt-in workflow holding the account's secrets.
+# No test here reaches AWS. The real-service conformance legs (spec §2.5) are
+# aws-live.yml, dispatch only, holding the account's secrets.
 #
 # The Olla publish uses the job's GitHub identity (trusted publishing). This
 # repository must be bound to dev.cajeta on Olla before the first release.
