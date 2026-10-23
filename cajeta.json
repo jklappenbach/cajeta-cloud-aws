@@ -23,7 +23,7 @@
 
         "capabilities": ["env", "filesystem", "network"],
 
-        // codec 0.9.1 (the XML reader) and crypto 0.1.1 (its skills) are
+        // codec 0.9.1 (the XML reader) and crypto 0.2.0 (Srp, for Cognito) are
         // direct dependencies. http 0.9.1 asks for codec 0.8.7 and crypto
         // 0.1.0, and cloud 0.4.1 for crypto 0.1.0; since cajeta 0.46.3 a bare
         // version is a floor within its major, so the resolver takes the
@@ -32,7 +32,7 @@
             "dev.cajeta.cloud":  "0.4.1",
             "dev.cajeta.http":   "0.9.1",
             "dev.cajeta.codec":  "0.9.1",
-            "dev.cajeta.crypto": "0.1.1"
+            "dev.cajeta.crypto": "0.2.0"
         },
 
         "dev-dependencies": {
