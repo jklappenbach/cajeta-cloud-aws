@@ -1,0 +1,149 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.codec.json.JsonValue;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.aws.AwsCredentials;
+import dev.cajeta.cloud.aws.CognitoClient;
+import dev.cajeta.cloud.aws.CognitoErrors;
+import dev.cajeta.cloud.aws.HttpCognitoTransport;
+import dev.cajeta.http.Bytes;
+import dev.cajeta.http.ClientRequest;
+
+/**
+ * The cognito-idp wire client (plan 3.1.1, identity spec §14.7 and §14.8):
+ * the request shape, SECRET_HASH, and the error table from `__type` to the
+ * port's IdentityException kinds.
+ */
+public class CognitoClientTest {
+    private static final String CLIENT = "3n4b5urk1ft4fl3mg5e62d9ado";
+
+    public CognitoClientTest() {
+        return;
+    }
+
+    @Test
+    public void theErrorTableMapsEveryRow() {
+        CognitoClientTest.maps("SignUp", "UsernameExistsException", "User already exists", IdentityException.USER_EXISTS());
+        CognitoClientTest.maps("ConfirmSignUp", "AliasExistsException", "An account with the email already exists.", IdentityException.USER_EXISTS());
+        CognitoClientTest.maps("AdminGetUser", "UserNotFoundException", "User does not exist.", IdentityException.USER_NOT_FOUND());
+        CognitoClientTest.maps("InitiateAuth", "UserNotFoundException", "User does not exist.", IdentityException.INVALID_CREDENTIALS());
+        CognitoClientTest.maps("RespondToAuthChallenge", "NotAuthorizedException", "Incorrect username or password.", IdentityException.INVALID_CREDENTIALS());
+        CognitoClientTest.maps("InitiateAuth", "NotAuthorizedException", "Password attempts exceeded", IdentityException.LOCKED());
+        CognitoClientTest.maps("InitiateAuth", "NotAuthorizedException", "Invalid Refresh Token", IdentityException.INVALID_TOKEN());
+        CognitoClientTest.maps("GetUser", "NotAuthorizedException", "Access Token has been revoked", IdentityException.INVALID_TOKEN());
+        CognitoClientTest.maps("ConfirmSignUp", "NotAuthorizedException", "User cannot be confirmed. Current status is CONFIRMED", -1);
+        CognitoClientTest.maps("InitiateAuth", "UserNotConfirmedException", "User is not confirmed.", IdentityException.NOT_CONFIRMED());
+        CognitoClientTest.maps("InitiateAuth", "PasswordResetRequiredException", "Password reset required for the user", IdentityException.PASSWORD_RESET_REQUIRED());
+        CognitoClientTest.maps("ConfirmSignUp", "CodeMismatchException", "Invalid verification code provided, please try again.", IdentityException.INVALID_CODE());
+        CognitoClientTest.maps("ConfirmSignUp", "ExpiredCodeException", "Invalid code provided, please request a code again.", IdentityException.CODE_EXPIRED());
+        CognitoClientTest.maps("ConfirmSignUp", "TooManyFailedAttemptsException", "Too many failed attempts.", IdentityException.LOCKED());
+        CognitoClientTest.maps("SignUp", "TooManyRequestsException", "Too many requests", IdentityException.TRANSIENT());
+        CognitoClientTest.maps("SignUp", "LimitExceededException", "Attempt limit exceeded", IdentityException.TRANSIENT());
+        CognitoClientTest.maps("SignUp", "InternalErrorException", "Internal error", IdentityException.TRANSIENT());
+        CognitoClientTest.maps("SignUp", "InvalidPasswordException", "Password did not conform with policy", IdentityException.POLICY_VIOLATION());
+        CognitoClientTest.maps("ChangePassword", "PasswordHistoryPolicyViolationException", "reused", IdentityException.POLICY_VIOLATION());
+        CognitoClientTest.maps("SignUp", "InvalidParameterException", "Invalid email address format.", IdentityException.POLICY_VIOLATION());
+        CognitoClientTest.maps("RevokeToken", "UnauthorizedException", "Invalid token", IdentityException.INVALID_TOKEN());
+        CognitoClientTest.maps("RevokeToken", "UnsupportedTokenTypeException", "Unsupported token", IdentityException.INVALID_TOKEN());
+        CognitoClientTest.maps("RespondToAuthChallenge", "MFAMethodNotFoundException", "No MFA", IdentityException.UNSUPPORTED_CAPABILITY());
+        CognitoClientTest.maps("AssociateSoftwareToken", "SoftwareTokenMFANotFoundException", "No TOTP", IdentityException.UNSUPPORTED_CAPABILITY());
+        CognitoClientTest.maps("RevokeToken", "UnsupportedOperationException", "Token revocation is not enabled", IdentityException.UNSUPPORTED_CAPABILITY());
+        CognitoClientTest.maps("SignUp", "OperationNotEnabledException", "off", IdentityException.UNSUPPORTED_CAPABILITY());
+        CognitoClientTest.maps("SignUp", "ResourceNotFoundException", "User pool client does not exist.", IdentityException.PROVIDER_ERROR());
+        CognitoClientTest.maps("SignUp", "InvalidUserPoolConfigurationException", "bad", IdentityException.PROVIDER_ERROR());
+        CognitoClientTest.maps("SignUp", "UserLambdaValidationException", "PreSignUp failed", IdentityException.PROVIDER_ERROR());
+        // A namespaced __type reads by its last segment.
+        CognitoClientTest.maps("SignUp", "com.amazonaws.cognito.identity.idp.model#UsernameExistsException", "exists", IdentityException.USER_EXISTS());
+        return;
+    }
+
+    @Test
+    public void aSuccessParsesAndAnErrorThrowsItsKind() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.reply(200, "{\"UserConfirmed\":false,\"UserSub\":\"4f3c2a10\"}");
+        t.error("UsernameExistsException", "User already exists");
+        t.reply(503, "<html>Service Unavailable</html>");
+        t.reply(400, "{}");
+        CognitoClient c = heap CognitoClient("us-east-1", CognitoClientTest.CLIENT, null, t);
+        JsonValue ok #= c.call("SignUp", "ada", "{\"ClientId\":\"x\"}");
+        String sub #= CognitoClient.text(ok, "UserSub");
+        Assert.equals("4f3c2a10", sub);
+        Assert.equals("SignUp", t.opAt(0));
+        Assert.isFalse(t.signedAt(0));
+        Assert.isTrue(CognitoClientTest.kindOfCall(c, "SignUp") == IdentityException.USER_EXISTS());
+        Assert.isTrue(CognitoClientTest.kindOfCall(c, "SignUp") == IdentityException.TRANSIENT());
+        Assert.isTrue(CognitoClientTest.kindOfCall(c, "SignUp") == IdentityException.PROVIDER_ERROR());
+        return;
+    }
+
+    @Test
+    public void anIdempotentConfirmIsASuccess() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.error("NotAuthorizedException", "User cannot be confirmed. Current status is CONFIRMED");
+        CognitoClient c = heap CognitoClient("us-east-1", CognitoClientTest.CLIENT, null, t);
+        JsonValue v #= c.call("ConfirmSignUp", "ada", "{}");
+        Assert.isTrue(v.kind() == JsonValue.OBJECT);
+        return;
+    }
+
+    @Test
+    public void adminCallsAreSigned() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.reply(200, "{}");
+        CognitoClient c = heap CognitoClient("us-east-1", CognitoClientTest.CLIENT, null, t);
+        JsonValue v #= c.admin("AdminGetUser", "ada", "{}");
+        Assert.isTrue(t.signedAt(0));
+        return;
+    }
+
+    @Test
+    public void theSecretHashIsTheClientSecretsHmac() {
+        ScriptedTransport t = heap ScriptedTransport();
+        CognitoClient plain = heap CognitoClient("us-east-1", CognitoClientTest.CLIENT, null, t);
+        Assert.isFalse(plain.hasSecret());
+        CognitoClient c = heap CognitoClient("us-east-1", CognitoClientTest.CLIENT, "cl1ent-s3cret-example", t);
+        Assert.isTrue(c.hasSecret());
+        String h #= c.secretHash("ada");
+        Assert.equals("TB8A8LzYJwu8hSxlV/u2lzvV985oevMz8ycuGAShe7o=", h);
+        return;
+    }
+
+    @Test
+    public void theHttpRequestCarriesTheTargetAndTypeAndASignatureWhenAdmin() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        AwsCredentials creds = heap AwsCredentials("AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", null);
+        HttpCognitoTransport h = heap HttpCognitoTransport("eu-west-2", creds, clock);
+        ClientRequest r #= h.request("InitiateAuth", "{\"AuthFlow\":\"USER_SRP_AUTH\"}", false);
+        Assert.isTrue(Bytes.equals(r.header("X-Amz-Target"),
+            "AWSCognitoIdentityProviderService.InitiateAuth"));
+        Assert.isTrue(Bytes.equals(r.header("Content-Type"), "application/x-amz-json-1.1"));
+        Assert.isFalse(r.hasHeader("Authorization"));
+        ClientRequest s #= h.request("AdminGetUser", "{}", true);
+        Assert.isTrue(Bytes.contains(s.header("Authorization"),
+            "Credential=AKIAIOSFODNN7EXAMPLE/20260101/eu-west-2/cognito-idp/aws4_request"));
+        String url #= HttpCognitoTransport.endpointFor("eu-west-2");
+        Assert.equals("https://cognito-idp.eu-west-2.amazonaws.com/", url);
+        return;
+    }
+
+    private static void maps(String operation, String type, String message, int32 kind) {
+        int32 got = CognitoErrors.kindOf(operation, type, message);
+        if (got != kind) {
+            Assert.fail(operation + " " + type + " '" + message + "': kind " + got + ", expected " + kind);
+        }
+        return;
+    }
+
+    private static int32 kindOfCall(CognitoClient c, String operation) {
+        try {
+            JsonValue v #= c.call(operation, "ada", "{}");
+        } catch (IdentityException e) {
+            return e.kind();
+        }
+        return -100;
+    }
+}

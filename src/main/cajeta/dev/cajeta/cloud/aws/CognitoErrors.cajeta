@@ -1,0 +1,73 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.IdentityException;
+
+/**
+ * Cognito's exceptions as the port's IdentityException kinds (identity spec
+ * §14.7). Cognito names the exception in `__type`; the status carries
+ * nothing. The operation matters for three rows: an unknown user on sign-in
+ * is invalid credentials (§14.6, so a caller cannot probe for accounts),
+ * NotAuthorized on a token is an invalid token, and NotAuthorized on
+ * confirming a confirmed user is success.
+ */
+public final class CognitoErrors {
+
+    /** The port kind for `type` (bare or `namespace#Name`), or -1 for success. */
+    public static int32 kindOf(String operation, String type, String message) {
+        String name #= CognitoErrors.bare(type);
+        String lower #= message.toLowerCase();
+        boolean signIn = operation.equals("InitiateAuth")
+            || operation.equals("RespondToAuthChallenge");
+        if (name.equals("UsernameExistsException") || name.equals("AliasExistsException")) {
+            return IdentityException.USER_EXISTS();
+        }
+        if (name.equals("UserNotFoundException")) {
+            if (signIn) return IdentityException.INVALID_CREDENTIALS();
+            return IdentityException.USER_NOT_FOUND();
+        }
+        if (name.equals("NotAuthorizedException")) {
+            if (operation.equals("ConfirmSignUp") && lower.indexOf("status is confirmed") >= 0L) {
+                return -1;
+            }
+            if (lower.indexOf("attempts exceeded") >= 0L) return IdentityException.LOCKED();
+            if (lower.indexOf("token") >= 0L) return IdentityException.INVALID_TOKEN();
+            return IdentityException.INVALID_CREDENTIALS();
+        }
+        if (name.equals("UserNotConfirmedException")) return IdentityException.NOT_CONFIRMED();
+        if (name.equals("PasswordResetRequiredException")) {
+            return IdentityException.PASSWORD_RESET_REQUIRED();
+        }
+        if (name.equals("CodeMismatchException")) return IdentityException.INVALID_CODE();
+        if (name.equals("ExpiredCodeException")) return IdentityException.CODE_EXPIRED();
+        if (name.equals("TooManyFailedAttemptsException")) return IdentityException.LOCKED();
+        if (name.equals("TooManyRequestsException") || name.equals("LimitExceededException")
+                || name.equals("InternalErrorException")) {
+            return IdentityException.TRANSIENT();
+        }
+        if (name.equals("InvalidPasswordException")
+                || name.equals("PasswordHistoryPolicyViolationException")
+                || name.equals("InvalidParameterException")) {
+            return IdentityException.POLICY_VIOLATION();
+        }
+        if (name.equals("UnauthorizedException") || name.equals("UnsupportedTokenTypeException")) {
+            return IdentityException.INVALID_TOKEN();
+        }
+        if (name.equals("MFAMethodNotFoundException")
+                || name.equals("SoftwareTokenMFANotFoundException")
+                || name.equals("UnsupportedOperationException")
+                || name.equals("OperationNotEnabledException")) {
+            return IdentityException.UNSUPPORTED_CAPABILITY();
+        }
+        return IdentityException.PROVIDER_ERROR();
+    }
+
+    // `com.amazonaws...#UsernameExistsException` -> `UsernameExistsException`.
+    static #String bare(String type) {
+        int32 n = type.byteLength();
+        int32 at = n - 1;
+        while (at >= 0 && type.byteAt(at) != (int8) 35) at = at - 1;
+        String out #= type.substring(at + 1, n);
+        return #out;
+    }
+}

@@ -1,0 +1,123 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.codec.Base64;
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.crypto.HmacSha256;
+
+/**
+ * The cognito-idp JSON API for one app client (identity spec §14.8): calls
+ * go through a [[CognitoTransport]], a success comes back parsed, and an
+ * error throws IdentityException of the kind [[CognitoErrors]] maps, naming
+ * the operation and the subject (never a password, code or token).
+ */
+public final class CognitoClient {
+    String region;
+    String clientId;
+    String clientSecret;
+    CognitoTransport transport;
+
+    /** `clientSecret` is null for a public app client. */
+    public CognitoClient(String region, String clientId, String clientSecret,
+                         CognitoTransport transport) {
+        this.region = "" + region;
+        this.clientId = "" + clientId;
+        this.clientSecret = null;
+        if (clientSecret != null && clientSecret.byteLength() > 0) {
+            this.clientSecret = "" + clientSecret;
+        }
+        this.transport #= transport;
+        return;
+    }
+
+    public #String appClientId() {
+        String out = "" + this.clientId;
+        return #out;
+    }
+
+    public #String regionName() {
+        String out = "" + this.region;
+        return #out;
+    }
+
+    public boolean hasSecret() { return this.clientSecret != null; }
+
+    /** SECRET_HASH: base64(HMAC-SHA256(client secret, username + client id)). */
+    public #String secretHash(String username) {
+        int8[] key #= this.clientSecret.toBytes();
+        String msg #= username + this.clientId;
+        int8[] m #= msg.toBytes();
+        int8[] mac #= HmacSha256.mac(key, (int64) this.clientSecret.byteLength(),
+            m, (int64) msg.byteLength());
+        return Base64.encode(mac, 32L);
+    }
+
+    /** A user-facing call, unsigned as the API defines. */
+    public #JsonValue call(String operation, String subject, String body) {
+        return this.exchange(operation, subject, body, false);
+    }
+
+    /** An administrative call, SigV4-signed. */
+    public #JsonValue admin(String operation, String subject, String body) {
+        return this.exchange(operation, subject, body, true);
+    }
+
+    private #JsonValue exchange(String operation, String subject, String body, boolean signed) {
+        CognitoReply r #= this.transport.send(operation, body, signed);
+        String text #= r.body();
+        int32 status = r.status();
+        JsonValue doc = null;
+        try {
+            doc #= Json.parse(text);
+        } catch (JsonParseException e) {
+            doc = null;
+        }
+        if (status >= 200 && status < 300) {
+            if (doc == null || doc.kind() != JsonValue.OBJECT) {
+                throw heap IdentityException(IdentityException.PROVIDER_ERROR(), "cognito",
+                    operation, subject, "the response was not a JSON object");
+            }
+            return #doc;
+        }
+        String type = "";
+        String message = "";
+        if (doc != null && doc.kind() == JsonValue.OBJECT) {
+            type #= CognitoClient.text(doc, "__type");
+            message #= CognitoClient.text(doc, "message");
+            if (message.byteLength() == 0) message #= CognitoClient.text(doc, "Message");
+        }
+        int32 kind = IdentityException.PROVIDER_ERROR();
+        if (type.byteLength() > 0) {
+            kind = CognitoErrors.kindOf(operation, type, message);
+        } else if (status >= 500) {
+            kind = IdentityException.TRANSIENT();
+        }
+        if (kind < 0) {
+            JsonValue empty #= Json.parse("{}");
+            return #empty;
+        }
+        String detail #= "HTTP " + status;
+        if (type.byteLength() > 0) {
+            String bare #= CognitoErrors.bare(type);
+            detail #= bare + ": " + message;
+        }
+        throw heap IdentityException(kind, "cognito", operation, subject, detail);
+    }
+
+    /** A string member's text, escapes decoded; "" when absent or not a string. */
+    public static #String text(JsonValue obj, String name) {
+        if (obj == null || obj.kind() != JsonValue.OBJECT) {
+            String none = "";
+            return #none;
+        }
+        JsonValue v = obj.object().get(name);
+        if (v == null || v.kind() != JsonValue.STRING) {
+            String none = "";
+            return #none;
+        }
+        return JsonText.unescape(v.asBytes(), v.asBytesLength());
+    }
+}

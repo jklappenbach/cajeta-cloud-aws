@@ -1,0 +1,10 @@
+package dev.cajeta.cloud.aws;
+
+/**
+ * Carries one cognito-idp call: the operation (`InitiateAuth`), its JSON
+ * request document, and whether it is an administrative call that must be
+ * SigV4-signed. [[HttpCognitoTransport]] is the real one; tests script one.
+ */
+public interface CognitoTransport {
+    #CognitoReply send(String operation, String body, boolean signed);
+}

@@ -1,0 +1,22 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+
+/** A cognito-idp response: the HTTP status and the JSON body. */
+public final class CognitoReply {
+    int32 code;
+    String text;
+
+    public CognitoReply(int32 status, String body) {
+        this.code = status;
+        this.text = "" + body;
+        return;
+    }
+
+    public int32 status() { return this.code; }
+
+    public #String body() {
+        String out = "" + this.text;
+        return #out;
+    }
+}

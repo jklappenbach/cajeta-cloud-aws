@@ -1,0 +1,71 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.error.RecoverableException;
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.http.ClientRequest;
+import dev.cajeta.http.ClientResponse;
+import dev.cajeta.http.client.HttpClient;
+
+/**
+ * cognito-idp over HTTPS (identity spec §14.8): `POST /` to
+ * `cognito-idp.<region>.amazonaws.com` with `X-Amz-Target:
+ * AWSCognitoIdentityProviderService.<Operation>` and
+ * `application/x-amz-json-1.1`. Administrative calls are SigV4-signed for
+ * service `cognito-idp` with the credentials given; without credentials an
+ * administrative call fails UNSUPPORTED_CAPABILITY. A call that never got an
+ * answer is TRANSIENT.
+ */
+public final class HttpCognitoTransport implements CognitoTransport {
+    String region;
+    String endpoint;
+    AwsCredentials creds;
+    TimeSource clock;
+    HttpClient client;
+
+    /** `credentials` may be null: then only user-facing calls work. */
+    public HttpCognitoTransport(String region, AwsCredentials credentials, TimeSource clock) {
+        this.region = "" + region;
+        this.endpoint #= HttpCognitoTransport.endpointFor(region);
+        this.creds #= credentials;
+        this.clock #= clock;
+        this.client = heap HttpClient();
+        return;
+    }
+
+    public static #String endpointFor(String region) {
+        return "https://cognito-idp." + region + ".amazonaws.com/";
+    }
+
+    /** The request `send` would make, signed when `signed`. */
+    public #ClientRequest request(String operation, String body, boolean signed) {
+        ClientRequest req #= ClientRequest.of("POST", this.endpoint);
+        req.header("X-Amz-Target", "AWSCognitoIdentityProviderService." + operation);
+        req.header("Content-Type", "application/x-amz-json-1.1");
+        req.body(body);
+        if (signed) {
+            if (this.creds == null) {
+                throw heap IdentityException(IdentityException.UNSUPPORTED_CAPABILITY(),
+                    "cognito", operation, "-",
+                    "an administrative call needs AWS credentials, and none were configured");
+            }
+            SigV4Signer signer = heap SigV4Signer(this.region, "cognito-idp");
+            signer.sign(req, this.creds, this.clock.nowSeconds());
+        }
+        return #req;
+    }
+
+    public #CognitoReply send(String operation, String body, boolean signed) {
+        ClientRequest req #= this.request(operation, body, signed);
+        ClientResponse r = null;
+        try {
+            r #= this.client.send(req);
+        } catch (RecoverableException e) {
+            throw heap IdentityException(IdentityException.TRANSIENT(), "cognito",
+                operation, "-", "the call got no answer: " + e.message);
+        }
+        String text #= r.bodyString();
+        return heap CognitoReply(r.status(), text);
+    }
+}
