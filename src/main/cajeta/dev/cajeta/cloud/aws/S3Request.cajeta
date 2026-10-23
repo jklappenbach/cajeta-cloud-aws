@@ -1,0 +1,86 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+
+/**
+ * One S3 REST call before addressing: the method, the object key as stored
+ * (unencoded; "" for the bucket itself), query parameters and headers in the
+ * order given, and an optional body the caller keeps alive until the call
+ * returns. [[S3Transport]] turns it into a signed request.
+ */
+public final class S3Request {
+    String verb;
+    String objectKey;
+    ArrayList<String> queryNames;
+    ArrayList<String> queryValues;
+    ArrayList<String> headerNames;
+    ArrayList<String> headerValues;
+    int8[] data;
+    int64 dataLen;
+
+    public S3Request(String method, String key) {
+        this.verb = "" + method;
+        this.objectKey = "" + key;
+        this.queryNames = heap ArrayList<String>();
+        this.queryValues = heap ArrayList<String>();
+        this.headerNames = heap ArrayList<String>();
+        this.headerValues = heap ArrayList<String>();
+        this.data = null;
+        this.dataLen = -1L;
+        return;
+    }
+
+    public void query(String name, String value) {
+        String n = "" + name;
+        String v = "" + value;
+        this.queryNames.add(#n);
+        this.queryValues.add(#v);
+        return;
+    }
+
+    public void header(String name, String value) {
+        String n = "" + name;
+        String v = "" + value;
+        this.headerNames.add(#n);
+        this.headerValues.add(#v);
+        return;
+    }
+
+    /** The body: `len` bytes of `bytes`, borrowed for the call. */
+    public void body(int8[] bytes, int64 len) {
+        this.data #= bytes;
+        this.dataLen = len;
+        return;
+    }
+
+    public String method() { return this.verb; }
+    public String key() { return this.objectKey; }
+    public int32 queryCount() { return this.queryNames.count(); }
+    public String queryName(int32 i) { return this.queryNames.get(i); }
+    public String queryValue(int32 i) { return this.queryValues.get(i); }
+    public int32 headerCount() { return this.headerNames.count(); }
+    public String headerName(int32 i) { return this.headerNames.get(i); }
+    public String headerValue(int32 i) { return this.headerValues.get(i); }
+    public boolean hasBody() { return this.dataLen >= 0L; }
+    public int8[] bodyBytes() { return this.data; }
+    public int64 bodyLength() { return this.dataLen; }
+
+    /** A header's value as given, or "" (names compare case-insensitively). */
+    public #String headerOr(String name) {
+        String want #= name.toLowerCase();
+        for (int32 i = 0; i < this.headerNames.count(); i++) {
+            String have #= this.headerNames.get(i).toLowerCase();
+            if (have.equals(want)) return "" + this.headerValues.get(i);
+        }
+        return "" + "";
+    }
+
+    /** A query parameter's value, or null when absent. */
+    public #String queryOr(String name) {
+        for (int32 i = 0; i < this.queryNames.count(); i++) {
+            if (this.queryNames.get(i).equals(name)) return "" + this.queryValues.get(i);
+        }
+        return null;
+    }
+}

@@ -1,0 +1,139 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.aws.AwsCredentials;
+import dev.cajeta.cloud.aws.HttpS3Transport;
+import dev.cajeta.cloud.aws.S3Errors;
+import dev.cajeta.cloud.aws.S3Request;
+import dev.cajeta.cloud.aws.S3Time;
+import dev.cajeta.http.Bytes;
+import dev.cajeta.http.ClientRequest;
+
+/**
+ * The S3 wire layer (plan 4.1.1 error mapping, 4.1.4 addressing, adapters
+ * spec 2.4): virtual-host addressing by default and path style for an
+ * S3-compatible endpoint, the key encoded once, requests SigV4-signed for
+ * `s3` with the body's hash, S3 error codes mapped to the parent's
+ * taxonomy, and S3's two date forms read as epoch milliseconds.
+ */
+public class S3WireTest {
+
+    public S3WireTest() {
+        return;
+    }
+
+    @Test
+    public void virtualHostAddressingIsTheDefault() {
+        HttpS3Transport t #= S3WireTest.transport(null, false);
+        S3Request r = heap S3Request("GET", "photos/2026/a b+c.jpg");
+        String url #= t.url(r);
+        Assert.equals("https://examplebucket.s3.us-east-1.amazonaws.com/photos/2026/a%20b%2Bc.jpg", url);
+        S3Request list = heap S3Request("GET", "");
+        list.query("list-type", "2");
+        list.query("prefix", "logs/2026 q1/");
+        String lu #= t.url(list);
+        Assert.equals("https://examplebucket.s3.us-east-1.amazonaws.com/?list-type=2&prefix=logs%2F2026%20q1%2F", lu);
+        return;
+    }
+
+    @Test
+    public void pathStyleWhenConfigured() {
+        HttpS3Transport t #= S3WireTest.transport("http://localhost:9000", true);
+        S3Request r = heap S3Request("GET", "photos/a.jpg");
+        String url #= t.url(r);
+        Assert.equals("http://localhost:9000/examplebucket/photos/a.jpg", url);
+        S3Request u = heap S3Request("POST", "big.bin");
+        u.query("uploads", "");
+        String uu #= t.url(u);
+        Assert.equals("http://localhost:9000/examplebucket/big.bin?uploads=", uu);
+        return;
+    }
+
+    @Test
+    public void requestsAreSignedForS3WithTheBodyHash() {
+        HttpS3Transport t #= S3WireTest.transport(null, false);
+        S3Request r = heap S3Request("PUT", "notes/hello.txt");
+        r.header("Content-Type", "text/plain");
+        r.header("If-None-Match", "*");
+        String text = "hello s3";
+        int8[] body #= text.toBytes();
+        r.body(body, 8L);
+        ClientRequest c #= t.request(r);
+        Assert.isTrue(Bytes.equals(c.header("X-Amz-Content-Sha256"),
+            "f2ff189a4ef686231302becc266e6c8d5eee814b868d11631f7660073fc9b613"));
+        Assert.isTrue(Bytes.contains(c.header("Authorization"),
+            "Credential=AKIAIOSFODNN7EXAMPLE/20260101/us-east-1/s3/aws4_request"));
+        Assert.isTrue(Bytes.contains(c.header("Authorization"), "if-none-match"));
+        Assert.isTrue(Bytes.equals(c.header("Host"), "examplebucket.s3.us-east-1.amazonaws.com"));
+        return;
+    }
+
+    @Test
+    public void errorCodesMapToTheParentTaxonomy() {
+        S3WireTest.maps(404, "NoSuchKey", CloudException.NOT_FOUND());
+        S3WireTest.maps(404, "NoSuchUpload", CloudException.NOT_FOUND());
+        S3WireTest.maps(404, "NoSuchBucket", CloudException.PROVIDER_ERROR());
+        S3WireTest.maps(403, "AccessDenied", CloudException.ACCESS_DENIED());
+        S3WireTest.maps(403, "InvalidAccessKeyId", CloudException.ACCESS_DENIED());
+        S3WireTest.maps(403, "SignatureDoesNotMatch", CloudException.ACCESS_DENIED());
+        S3WireTest.maps(400, "ExpiredToken", CloudException.ACCESS_DENIED());
+        S3WireTest.maps(412, "PreconditionFailed", CloudException.PRECONDITION_FAILED());
+        S3WireTest.maps(503, "SlowDown", CloudException.TRANSIENT());
+        S3WireTest.maps(503, "ServiceUnavailable", CloudException.TRANSIENT());
+        S3WireTest.maps(500, "InternalError", CloudException.TRANSIENT());
+        S3WireTest.maps(400, "RequestTimeout", CloudException.TRANSIENT());
+        S3WireTest.maps(409, "ConditionalRequestConflict", CloudException.TRANSIENT());
+        S3WireTest.maps(416, "InvalidRange", CloudException.PROVIDER_ERROR());
+        S3WireTest.maps(400, "EntityTooSmall", CloudException.PROVIDER_ERROR());
+        // A HEAD answer has no body: the status alone decides.
+        S3WireTest.maps(404, "", CloudException.NOT_FOUND());
+        S3WireTest.maps(403, "", CloudException.ACCESS_DENIED());
+        S3WireTest.maps(412, "", CloudException.PRECONDITION_FAILED());
+        S3WireTest.maps(503, "", CloudException.TRANSIENT());
+        S3WireTest.maps(429, "", CloudException.TRANSIENT());
+        S3WireTest.maps(400, "", CloudException.PROVIDER_ERROR());
+        return;
+    }
+
+    @Test
+    public void theErrorDocumentNamesItsCode() {
+        String doc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code>"
+            + "<Message>The specified key does not exist.</Message><Key>a/b.txt</Key>"
+            + "<RequestId>4442587FB7D0A2F9</RequestId></Error>";
+        int8[] b #= doc.toBytes();
+        String code #= S3Errors.codeOf(b, (int64) doc.byteLength());
+        Assert.equals("NoSuchKey", code);
+        String msg #= S3Errors.messageOf(b, (int64) doc.byteLength());
+        Assert.equals("The specified key does not exist.", msg);
+        String none #= S3Errors.codeOf(b, 0L);
+        Assert.equals("", none);
+        return;
+    }
+
+    @Test
+    public void s3DatesReadAsEpochMilliseconds() {
+        Assert.isTrue(S3Time.httpDate("Wed, 21 Oct 2015 07:28:00 GMT") == 1445412480000L);
+        Assert.isTrue(S3Time.iso8601("2009-10-12T17:50:30.000Z") == 1255369830000L);
+        Assert.isTrue(S3Time.iso8601("2009-10-12T17:50:30Z") == 1255369830000L);
+        Assert.isTrue(S3Time.httpDate("not a date") == 0L);
+        return;
+    }
+
+    private static void maps(int32 status, String code, int32 kind) {
+        int32 got = S3Errors.kindOf(status, code);
+        if (got != kind) {
+            Assert.fail("HTTP " + status + " '" + code + "': kind " + got + ", expected " + kind);
+        }
+        return;
+    }
+
+    private static #HttpS3Transport transport(String endpoint, boolean pathStyle) {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        AwsCredentials creds = heap AwsCredentials("AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", null);
+        return heap HttpS3Transport("us-east-1", "examplebucket", endpoint, pathStyle, #creds, #clock);
+    }
+}

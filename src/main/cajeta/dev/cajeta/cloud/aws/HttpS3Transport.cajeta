@@ -1,0 +1,143 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.error.RecoverableException;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.http.Bytes;
+import dev.cajeta.http.ClientRequest;
+import dev.cajeta.http.ClientResponse;
+import dev.cajeta.http.client.HttpClient;
+
+/**
+ * S3's REST API over HTTPS (adapters spec 2.4). Addressing is virtual-host
+ * style, `https://<bucket>.s3.<region>.amazonaws.com/<key>`, unless path
+ * style is configured for an S3-compatible endpoint
+ * (`<endpoint>/<bucket>/<key>`). The key is encoded once: every byte but the
+ * unreserved characters and `/`. Requests are SigV4-signed for `s3`, the body
+ * hashed. A call that got no answer is TRANSIENT.
+ */
+public final class HttpS3Transport implements S3Transport {
+    String region;
+    String bucket;
+    String base;
+    AwsCredentials creds;
+    TimeSource clock;
+    HttpClient client;
+
+    /** `endpoint` is null for AWS itself; `pathStyle` puts the bucket in the path. */
+    public HttpS3Transport(String region, String bucket, String endpoint, boolean pathStyle,
+                           #AwsCredentials credentials, #TimeSource clock) {
+        this.region = "" + region;
+        this.bucket = "" + bucket;
+        if (pathStyle) {
+            String ep = "https://s3." + region + ".amazonaws.com";
+            if (endpoint != null) ep #= HttpS3Transport.trimSlash(endpoint);
+            this.base #= ep + "/" + bucket;
+        } else if (endpoint == null) {
+            this.base #= "https://" + bucket + ".s3." + region + ".amazonaws.com";
+        } else {
+            String ep #= HttpS3Transport.trimSlash(endpoint);
+            int64 at = ep.indexOf("://");
+            String scheme #= ep.substring(0, (int32) (at + 3L));
+            String host #= ep.substring((int32) (at + 3L), ep.byteLength());
+            this.base #= scheme + bucket + "." + host;
+        }
+        this.creds #= credentials;
+        this.clock #= clock;
+        this.client = heap HttpClient();
+        return;
+    }
+
+    /** The request's URL. */
+    public #String url(S3Request r) {
+        StringBuilder b = heap StringBuilder();
+        b.append(this.base);
+        b.append("/");
+        String path #= HttpS3Transport.encode(r.key(), false);
+        b.append(path);
+        for (int32 i = 0; i < r.queryCount(); i++) {
+            if (i == 0) b.append("?");
+            else b.append("&");
+            String n #= HttpS3Transport.encode(r.queryName(i), true);
+            String v #= HttpS3Transport.encode(r.queryValue(i), true);
+            b.append(n);
+            b.append("=");
+            b.append(v);
+        }
+        return b.toString();
+    }
+
+    /** The signed request `send` makes. */
+    public #ClientRequest request(S3Request r) {
+        String url #= this.url(r);
+        ClientRequest req #= ClientRequest.of(r.method(), url);
+        for (int32 i = 0; i < r.headerCount(); i++) {
+            req.header(r.headerName(i), r.headerValue(i));
+        }
+        if (r.hasBody()) {
+            req.body(r.bodyBytes(), (int32) r.bodyLength());
+        }
+        SigV4Signer signer = heap SigV4Signer(this.region, "s3");
+        signer.sign(req, this.creds, this.clock.nowSeconds());
+        return #req;
+    }
+
+    public #S3Reply send(S3Request r) {
+        ClientRequest req #= this.request(r);
+        ClientResponse resp = null;
+        try {
+            resp #= this.client.send(req);
+        } catch (RecoverableException e) {
+            throw heap CloudException(CloudException.TRANSIENT(), "s3", r.method(), r.key(),
+                "the call got no answer: " + e.message);
+        }
+        int8[] body #= Bytes.copyOf(resp.body());
+        S3Reply out = heap S3Reply(resp.status(), #body, (int64) resp.bodyLength());
+        HttpS3Transport.keep(out, resp, "ETag");
+        HttpS3Transport.keep(out, resp, "Content-Type");
+        HttpS3Transport.keep(out, resp, "Content-Length");
+        HttpS3Transport.keep(out, resp, "Content-Range");
+        HttpS3Transport.keep(out, resp, "Last-Modified");
+        return #out;
+    }
+
+    private static void keep(S3Reply out, ClientResponse resp, String name) {
+        String v #= resp.headerString(name);
+        if (v != null) out.header(name, v);
+    }
+
+    private static #String trimSlash(String s) {
+        int32 n = s.byteLength();
+        if (n > 0 && s.byteAt(n - 1) == (int8) 47) return s.substring(0, n - 1);
+        return "" + s;
+    }
+
+    /** Percent-encodes all but A-Z a-z 0-9 - . _ ~, and `/` unless `slash`. */
+    public static #String encode(String s, boolean slash) {
+        int32 n = s.byteLength();
+        int8[] out = heap int8[n * 3 + 1];
+        int32 o = 0;
+        for (int32 i = 0; i < n; i++) {
+            int32 c = ((int32) s.byteAt(i)) & 0xff;
+            boolean keep = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+                || c == 45 || c == 46 || c == 95 || c == 126 || (c == 47 && !slash);
+            if (keep) {
+                out[o] = (int8) c;
+                o = o + 1;
+            } else {
+                out[o] = (int8) 37;
+                out[o + 1] = HttpS3Transport.hex(c >> 4);
+                out[o + 2] = HttpS3Transport.hex(c & 15);
+                o = o + 3;
+            }
+        }
+        return heap String(#out, o);
+    }
+
+    private static int8 hex(int32 v) {
+        if (v < 10) return (int8) (48 + v);
+        return (int8) (55 + v);
+    }
+}

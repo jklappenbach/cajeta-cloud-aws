@@ -1,0 +1,9 @@
+package dev.cajeta.cloud.aws;
+
+/**
+ * Carries one S3 call. [[HttpS3Transport]] addresses, signs and sends it;
+ * tests answer from a script or an in-memory bucket.
+ */
+public interface S3Transport {
+    #S3Reply send(S3Request request);
+}

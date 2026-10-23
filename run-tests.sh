@@ -27,7 +27,8 @@ OLLA_URL="${OLLA_URL:-https://olla.cajeta.dev}"
 UNIT_REPO="${UNIT_REPO:-$here/../cajeta-unit}"
 
 out="$(mktemp -d)"
-trap 'rm -rf "$out"' EXIT
+# KEEP_OUT=1 keeps the build directory (the test binary) for a rerun or a debugger.
+if [[ -n "${KEEP_OUT:-}" ]]; then echo ">> keeping $out"; else trap 'rm -rf "$out"' EXIT; fi
 
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1;

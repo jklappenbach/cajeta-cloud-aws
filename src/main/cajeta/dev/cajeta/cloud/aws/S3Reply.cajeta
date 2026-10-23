@@ -1,0 +1,50 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+
+/** An S3 answer: the status, the headers the adapter reads, and the body. */
+public final class S3Reply {
+    int32 code;
+    ArrayList<String> names;
+    ArrayList<String> values;
+    int8[] data;
+    int64 dataLen;
+
+    public S3Reply(int32 status, #int8[] body, int64 len) {
+        this.code = status;
+        this.names = heap ArrayList<String>();
+        this.values = heap ArrayList<String>();
+        this.data #= body;
+        this.dataLen = len;
+        if (this.data == null) this.dataLen = 0L;
+        return;
+    }
+
+    /** A reply with a text body (tests and error documents). */
+    public static #S3Reply of(int32 status, String text) {
+        int8[] b #= text.toBytes();
+        return heap S3Reply(status, #b, (int64) text.byteLength());
+    }
+
+    public void header(String name, String value) {
+        String n #= name.toLowerCase();
+        String v = "" + value;
+        this.names.add(#n);
+        this.values.add(#v);
+        return;
+    }
+
+    public int32 status() { return this.code; }
+    public int8[] body() { return this.data; }
+    public int64 bodyLength() { return this.dataLen; }
+
+    /** A header's value, or "" when absent; names compare case-insensitively. */
+    public #String headerOr(String name) {
+        String want #= name.toLowerCase();
+        for (int32 i = 0; i < this.names.count(); i++) {
+            if (this.names.get(i).equals(want)) return "" + this.values.get(i);
+        }
+        return "" + "";
+    }
+}

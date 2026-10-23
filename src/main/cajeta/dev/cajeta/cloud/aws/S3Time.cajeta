@@ -1,0 +1,69 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+
+/**
+ * S3's two date forms as epoch milliseconds: the HTTP `Last-Modified`
+ * (`Wed, 21 Oct 2015 07:28:00 GMT`) and ListObjectsV2's ISO 8601
+ * (`2009-10-12T17:50:30.000Z`). Anything else reads as 0.
+ */
+public final class S3Time {
+    private static final String MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+    public static int64 httpDate(String s) {
+        // "Www, DD Mon YYYY HH:MM:SS GMT"
+        if (s.byteLength() < 29) return 0L;
+        int64 day = S3Time.num(s, 5, 2);
+        String mon #= s.substring(8, 11);
+        int64 m = S3Time.MONTHS.indexOf(mon);
+        if (m < 0L || m % 3L != 0L) return 0L;
+        int64 year = S3Time.num(s, 12, 4);
+        int64 hh = S3Time.num(s, 17, 2);
+        int64 mi = S3Time.num(s, 20, 2);
+        int64 ss = S3Time.num(s, 23, 2);
+        if (day < 0L || year < 0L || hh < 0L || mi < 0L || ss < 0L) return 0L;
+        return S3Time.epochMillis(year, m / 3L + 1L, day, hh, mi, ss);
+    }
+
+    public static int64 iso8601(String s) {
+        // "YYYY-MM-DDTHH:MM:SS[.sss]Z"
+        if (s.byteLength() < 20) return 0L;
+        int64 year = S3Time.num(s, 0, 4);
+        int64 m = S3Time.num(s, 5, 2);
+        int64 d = S3Time.num(s, 8, 2);
+        int64 hh = S3Time.num(s, 11, 2);
+        int64 mi = S3Time.num(s, 14, 2);
+        int64 ss = S3Time.num(s, 17, 2);
+        if (year < 0L || m < 1L || d < 0L || hh < 0L || mi < 0L || ss < 0L) return 0L;
+        int64 ms = 0L;
+        if (s.byteLength() >= 24 && s.byteAt(19) == (int8) 46) {
+            int64 f = S3Time.num(s, 20, 3);
+            if (f > 0L) ms = f;
+        }
+        return S3Time.epochMillis(year, m, d, hh, mi, ss) + ms;
+    }
+
+    // Hinnant's days_from_civil.
+    private static int64 epochMillis(int64 y0, int64 m, int64 d, int64 hh, int64 mi, int64 ss) {
+        int64 y = y0;
+        if (m <= 2L) y = y - 1L;
+        int64 era = y / 400L;
+        int64 yoe = y - era * 400L;
+        int64 mp = m > 2L ? m - 3L : m + 9L;
+        int64 doy = (153L * mp + 2L) / 5L + d - 1L;
+        int64 doe = yoe * 365L + yoe / 4L - yoe / 100L + doy;
+        int64 days = era * 146097L + doe - 719468L;
+        return ((days * 24L + hh) * 60L + mi) * 60000L + ss * 1000L;
+    }
+
+    // The decimal at [at, at+n), or -1 when it is not all digits.
+    private static int64 num(String s, int32 at, int32 n) {
+        int64 v = 0L;
+        for (int32 i = 0; i < n; i++) {
+            int32 c = (int32) s.byteAt(at + i);
+            if (c < 48 || c > 57) return -1L;
+            v = v * 10L + (int64) (c - 48);
+        }
+        return v;
+    }
+}

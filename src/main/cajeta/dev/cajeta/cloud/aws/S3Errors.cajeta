@@ -1,0 +1,88 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.codec.xml.XmlEvent;
+import dev.cajeta.codec.xml.XmlParseException;
+import dev.cajeta.codec.xml.XmlReader;
+
+/**
+ * S3 error codes as the parent's CloudException kinds (adapters spec 2.4,
+ * parent §11.1). The `<Error><Code>` decides; a HEAD answer has no body, so
+ * the status alone decides there.
+ */
+public final class S3Errors {
+
+    public static int32 kindOf(int32 status, String code) {
+        if (code.byteLength() > 0) {
+            if (code.equals("NoSuchKey") || code.equals("NoSuchUpload")) return CloudException.NOT_FOUND();
+            if (code.equals("AccessDenied") || code.equals("InvalidAccessKeyId")
+                    || code.equals("SignatureDoesNotMatch") || code.equals("ExpiredToken")
+                    || code.equals("InvalidToken") || code.equals("AllAccessDisabled")) {
+                return CloudException.ACCESS_DENIED();
+            }
+            if (code.equals("PreconditionFailed")) return CloudException.PRECONDITION_FAILED();
+            if (code.equals("SlowDown") || code.equals("ServiceUnavailable") || code.equals("InternalError")
+                    || code.equals("RequestTimeout") || code.equals("ConditionalRequestConflict")) {
+                return CloudException.TRANSIENT();
+            }
+            return CloudException.PROVIDER_ERROR();
+        }
+        if (status == 404) return CloudException.NOT_FOUND();
+        if (status == 403) return CloudException.ACCESS_DENIED();
+        if (status == 412) return CloudException.PRECONDITION_FAILED();
+        if (status >= 500 || status == 429) return CloudException.TRANSIENT();
+        return CloudException.PROVIDER_ERROR();
+    }
+
+    /** The `<Code>` of an S3 error document, or "". */
+    public static #String codeOf(int8[] body, int64 len) {
+        return S3Errors.field(body, len, "Code");
+    }
+
+    /** The `<Message>` of an S3 error document, or "". */
+    public static #String messageOf(int8[] body, int64 len) {
+        return S3Errors.field(body, len, "Message");
+    }
+
+    /** The exception an S3 error answer raises. */
+    public static #CloudException of(S3Reply r, String operation, String key) {
+        String code #= S3Errors.codeOf(r.body(), r.bodyLength());
+        String msg #= S3Errors.messageOf(r.body(), r.bodyLength());
+        int32 kind = S3Errors.kindOf(r.status(), code);
+        String detail #= "HTTP " + r.status();
+        if (code.byteLength() > 0) detail #= code + ": " + msg;
+        return heap CloudException(kind, "s3", operation, key, detail);
+    }
+
+    // The text of the first <name> under the root <Error>, or "".
+    private static #String field(int8[] body, int64 len, String name) {
+        // Owned from the start: a literal-initialised local moved into inside
+        // a try that is skipped raises a bogus exception (0x3) at `return #out`
+        // on cajeta v0.46.3.
+        String out #= "" + "";
+        if (body != null && len > 0L) {
+            try {
+                XmlReader x = heap XmlReader(body, len);
+                int32 ev = x.next();
+                boolean done = false;
+                while (!done && ev != XmlEvent.END_DOCUMENT) {
+                    if (ev == XmlEvent.START_ELEMENT) {
+                        if (x.depth() == 1) {
+                            if (!x.name().equals("Error")) done = true;
+                        } else if (x.depth() == 2 && x.name().equals(name)) {
+                            out #= x.readText();
+                            done = true;
+                        } else {
+                            x.skip();
+                        }
+                    }
+                    if (!done) ev = x.next();
+                }
+            } catch (XmlParseException e) {
+                out #= "" + "";
+            }
+        }
+        return #out;
+    }
+}
