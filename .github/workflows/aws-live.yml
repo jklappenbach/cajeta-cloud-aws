@@ -1,0 +1,60 @@
+# The real-service conformance legs (adapters spec 2.5): the identity suite
+# against a real Cognito user pool and the object-store suite against a real
+# S3 bucket. Opt-in: dispatch only, never on push, because it needs the
+# account's secrets and spends real requests.
+#
+# Repository secrets it reads:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY   credentials for the test account
+#   AWS_REGION                                 the pool's and bucket's region
+#   CAJETA_AWS_TEST_POOL, CAJETA_AWS_TEST_CLIENT   a user pool id and app client id
+#   CAJETA_AWS_TEST_BUCKET                     a bucket the suite may write under
+#                                              cajeta-conformance/
+#
+# The run fails if either live leg was skipped, so a missing secret cannot
+# pass as green.
+
+name: aws-live
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CAJETA_VERSION: v0.46.3
+
+jobs:
+  live:
+    name: conformance against AWS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cajeta-cloud-aws
+        uses: actions/checkout@v4
+
+      - name: Install cajeta toolchain (${{ env.CAJETA_VERSION }})
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$CAJETA_VERSION" --repo jklappenbach/cajeta \
+            --pattern 'cajeta_*_amd64.deb' --dir /tmp
+          sudo apt-get update
+          sudo apt-get install -y /tmp/cajeta_*_amd64.deb
+
+      - name: Run the suite with the live legs
+        timeout-minutes: 45
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          CAJETA_AWS_TEST_POOL: ${{ secrets.CAJETA_AWS_TEST_POOL }}
+          CAJETA_AWS_TEST_CLIENT: ${{ secrets.CAJETA_AWS_TEST_CLIENT }}
+          CAJETA_AWS_TEST_BUCKET: ${{ secrets.CAJETA_AWS_TEST_BUCKET }}
+        run: |
+          set -euo pipefail
+          ./run-tests.sh 2>&1 | tee live.log
+          if grep -E "SKIP .*(AgainstARealPool|AgainstARealBucket)" live.log; then
+            echo "::error::a live leg was skipped; check the repository secrets"
+            exit 1
+          fi
