@@ -1,0 +1,71 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.error.RecoverableException;
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.http.ClientResponse;
+import dev.cajeta.http.client.HttpClient;
+
+/**
+ * Fetches a pool's JWKS over HTTPS (identity spec §14.4), with the lifetime
+ * its `Cache-Control` grants. A failed fetch is TRANSIENT when it may pass on
+ * a retry (no connection, a 5xx) and PROVIDER_ERROR otherwise.
+ */
+public final class HttpJwksSource implements JwksSource {
+    String url;
+    HttpClient client;
+
+    public HttpJwksSource(String url) {
+        this.url = "" + url;
+        this.client = heap HttpClient();
+        return;
+    }
+
+    public #JwksDocument fetch() {
+        ClientResponse r = null;
+        try {
+            r #= this.client.get(this.url);
+        } catch (RecoverableException e) {
+            throw heap IdentityException(IdentityException.TRANSIENT(), "cognito",
+                "jwks", this.url, "fetching the signing keys failed: " + e.message);
+        }
+        int32 status = r.status();
+        if (status >= 500) {
+            throw heap IdentityException(IdentityException.TRANSIENT(), "cognito",
+                "jwks", this.url, "the signing keys answered HTTP " + status);
+        }
+        if (!r.isSuccess()) {
+            throw heap IdentityException(IdentityException.PROVIDER_ERROR(), "cognito",
+                "jwks", this.url, "the signing keys answered HTTP " + status
+                + "; check the region and user pool id");
+        }
+        String body #= r.bodyString();
+        String cc #= r.headerString("Cache-Control");
+        return heap JwksDocument(body, HttpJwksSource.maxAgeOf(cc));
+    }
+
+    /**
+     * The lifetime a `Cache-Control` value grants in seconds: its max-age, 0
+     * under no-store or no-cache, -1 when it names none (or is null).
+     */
+    public static int64 maxAgeOf(String header) {
+        if (header == null) return -1L;
+        String h #= header.toLowerCase();
+        if (h.indexOf("no-store") >= 0L || h.indexOf("no-cache") >= 0L) return 0L;
+        int64 at = h.indexOf("max-age=");
+        if (at < 0L) return -1L;
+        int32 i = (int32) at + 8;
+        int32 n = h.byteLength();
+        int64 v = 0L;
+        boolean any = false;
+        while (i < n) {
+            int8 c = h.byteAt(i);
+            if (c < (int8) 48 || c > (int8) 57) break;
+            if (v < 100000000000L) v = v * 10L + (int64) (c - (int8) 48);
+            any = true;
+            i = i + 1;
+        }
+        if (!any) return -1L;
+        return v;
+    }
+}

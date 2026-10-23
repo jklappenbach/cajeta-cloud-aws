@@ -1,0 +1,10 @@
+package dev.cajeta.cloud.aws;
+
+/**
+ * Where a [[CognitoTokenVerifier]] gets the pool's signing keys.
+ * [[HttpJwksSource]] fetches the pool's `/.well-known/jwks.json`; a test
+ * serves fixtures.
+ */
+public interface JwksSource {
+    #JwksDocument fetch();
+}

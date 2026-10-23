@@ -1,0 +1,26 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+
+/**
+ * A fetched JWKS document and how long it may be cached: the response's
+ * `Cache-Control` max-age in seconds, 0 for no-store or no-cache, -1 when the
+ * response gave no lifetime.
+ */
+public final class JwksDocument {
+    String doc;
+    int64 age;
+
+    public JwksDocument(String json, int64 maxAgeSeconds) {
+        this.doc = "" + json;
+        this.age = maxAgeSeconds;
+        return;
+    }
+
+    public #String json() {
+        String out = "" + this.doc;
+        return #out;
+    }
+
+    public int64 maxAge() { return this.age; }
+}

@@ -1,0 +1,194 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.lang.String;
+import cajeta.io.file.File;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.identity.Claims;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.Jwks;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.identity.TokenUse;
+import dev.cajeta.cloud.aws.CognitoTokenVerifier;
+import dev.cajeta.cloud.aws.HttpJwksSource;
+
+/**
+ * Token verification against a pool's JWKS (plan 3.1.2, identity spec
+ * §5.3 and §14.4). The fixtures in src/test/resources/cognito are shaped like
+ * Cognito's: two RSA keys (access and id), RS256, the pool's issuer, client_id
+ * on access tokens and aud on id tokens, groups under cognito:groups. They
+ * were generated once by generate.py there (the keys are random, so it is not
+ * rerun); run-tests.sh exports COGNITO_FIXTURES as that directory. Tokens are
+ * issued at 1767225600 and expire an hour later.
+ */
+public class CognitoTokenVerifierTest {
+    private static final int64 IAT = 1767225600L;
+    private static final int64 EXP = 1767229200L;
+    private static final String CLIENT = "3n4b5urk1ft4fl3mg5e62d9ado";
+
+    public CognitoTokenVerifierTest() {
+        return;
+    }
+
+    @Test
+    public void anAccessTokenVerifiesWithItsGroups() {
+        FixtureJwksSource keys = heap FixtureJwksSource(3600L);
+        String doc #= CognitoTokenVerifierTest.fixture("jwks.json");
+        keys.then(doc);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoTokenVerifierTest.IAT + 60L);
+        CognitoTokenVerifier v #= CognitoTokenVerifierTest.verifier(keys, clock);
+        String token #= CognitoTokenVerifierTest.fixture("access.jwt");
+        Claims c #= v.verify(token, TokenUse.ACCESS());
+        Assert.equals("4f3c2a10-9b7e-4d6a-8c21-0e5f7a9b3d14", c.subject());
+        Assert.equals("ada", c.username());
+        Assert.equals(CognitoTokenVerifierTest.CLIENT, c.audience());
+        Assert.isTrue(c.tokenUse() == TokenUse.ACCESS());
+        Assert.isTrue(c.expiresAt() == CognitoTokenVerifierTest.EXP);
+        Assert.isTrue(c.groupCount() == 2);
+        Assert.isTrue(c.inGroup("admins"));
+        Assert.isTrue(c.inGroup("editors"));
+        Assert.isTrue(keys.fetches() == 1);
+        return;
+    }
+
+    @Test
+    public void anIdTokenVerifiesWithItsAttributes() {
+        FixtureJwksSource keys #= CognitoTokenVerifierTest.source("jwks.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoTokenVerifierTest.IAT + 60L);
+        CognitoTokenVerifier v #= CognitoTokenVerifierTest.verifier(keys, clock);
+        String token #= CognitoTokenVerifierTest.fixture("id.jwt");
+        Claims c #= v.verify(token, TokenUse.ID());
+        Assert.equals(CognitoTokenVerifierTest.CLIENT, c.audience());
+        Assert.equals("ada@example.com", c.claim("email"));
+        Assert.equals("true", c.claim("email_verified"));
+        Assert.equals("engines", c.claim("custom:team"));
+        Assert.isTrue(c.inGroup("admins"));
+        return;
+    }
+
+    @Test
+    public void eachFailedCheckIsNamed() {
+        FixtureJwksSource keys #= CognitoTokenVerifierTest.source("jwks.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoTokenVerifierTest.IAT + 60L);
+        CognitoTokenVerifier v #= CognitoTokenVerifierTest.verifier(keys, clock);
+        CognitoTokenVerifierTest.refused(v, "access-wrong-issuer.jwt", TokenUse.ACCESS(), "issuer");
+        CognitoTokenVerifierTest.refused(v, "access-wrong-client.jwt", TokenUse.ACCESS(), "audience");
+        CognitoTokenVerifierTest.refused(v, "id-wrong-audience.jwt", TokenUse.ID(), "audience");
+        CognitoTokenVerifierTest.refused(v, "access-forged.jwt", TokenUse.ACCESS(), "signature");
+        CognitoTokenVerifierTest.refused(v, "access.jwt", TokenUse.ID(), "use");
+        clock.set(CognitoTokenVerifierTest.EXP);
+        CognitoTokenVerifierTest.refused(v, "access.jwt", TokenUse.ACCESS(), "expiry");
+        return;
+    }
+
+    @Test
+    public void anUnknownKidRefetchesOnceThenRefuses() {
+        FixtureJwksSource keys #= CognitoTokenVerifierTest.source("jwks.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoTokenVerifierTest.IAT + 60L);
+        CognitoTokenVerifier v #= CognitoTokenVerifierTest.verifier(keys, clock);
+        CognitoTokenVerifierTest.refused(v, "access-rotated-key.jwt", TokenUse.ACCESS(), "key");
+        Assert.isTrue(keys.fetches() == 2);
+        // Within the refetch cool-down an unknown kid costs no fetch.
+        CognitoTokenVerifierTest.refused(v, "access-rotated-key.jwt", TokenUse.ACCESS(), "key");
+        Assert.isTrue(keys.fetches() == 2);
+        clock.advance(61L);
+        CognitoTokenVerifierTest.refused(v, "access-rotated-key.jwt", TokenUse.ACCESS(), "key");
+        Assert.isTrue(keys.fetches() == 3);
+        return;
+    }
+
+    @Test
+    public void aRotatedKeyIsFoundByTheRefetch() {
+        FixtureJwksSource keys #= CognitoTokenVerifierTest.source("jwks.json", 3600L);
+        String rotated #= CognitoTokenVerifierTest.fixture("jwks-rotated.json");
+        keys.then(rotated);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoTokenVerifierTest.IAT + 60L);
+        CognitoTokenVerifier v #= CognitoTokenVerifierTest.verifier(keys, clock);
+        String old #= CognitoTokenVerifierTest.fixture("access.jwt");
+        Claims first #= v.verify(old, TokenUse.ACCESS());
+        String token #= CognitoTokenVerifierTest.fixture("access-rotated-key.jwt");
+        Claims c #= v.verify(token, TokenUse.ACCESS());
+        Assert.equals("ada", c.username());
+        Assert.isTrue(keys.fetches() == 2);
+        return;
+    }
+
+    @Test
+    public void theKeysAreCachedForTheirMaxAge() {
+        FixtureJwksSource keys #= CognitoTokenVerifierTest.source("jwks.json", 300L);
+        ManualTimeSource clock = heap ManualTimeSource(CognitoTokenVerifierTest.IAT + 60L);
+        CognitoTokenVerifier v #= CognitoTokenVerifierTest.verifier(keys, clock);
+        String token #= CognitoTokenVerifierTest.fixture("access.jwt");
+        Claims a #= v.verify(token, TokenUse.ACCESS());
+        Claims b #= v.verify(token, TokenUse.ACCESS());
+        Assert.isTrue(keys.fetches() == 1);
+        clock.advance(301L);
+        Claims c #= v.verify(token, TokenUse.ACCESS());
+        Assert.isTrue(keys.fetches() == 2);
+        Jwks doc #= v.jwks();
+        String json #= doc.json();
+        Assert.isTrue(json.indexOf("access-kid-1") >= 0L);
+        return;
+    }
+
+    @Test
+    public void theIssuerAndJwksUrlFollowTheRegionAndPool() {
+        String iss #= CognitoTokenVerifier.issuerFor("us-east-1", "us-east-1_ExAmPlE12");
+        Assert.equals("https://cognito-idp.us-east-1.amazonaws.com/us-east-1_ExAmPlE12", iss);
+        String url #= CognitoTokenVerifier.jwksUrlFor("eu-west-2", "eu-west-2_AbC");
+        Assert.equals("https://cognito-idp.eu-west-2.amazonaws.com/eu-west-2_AbC/.well-known/jwks.json", url);
+        return;
+    }
+
+    @Test
+    public void cacheControlMaxAgeIsRead() {
+        Assert.isTrue(HttpJwksSource.maxAgeOf("public, max-age=86400, must-revalidate") == 86400L);
+        Assert.isTrue(HttpJwksSource.maxAgeOf("max-age=0") == 0L);
+        Assert.isTrue(HttpJwksSource.maxAgeOf("no-store") == 0L);
+        Assert.isTrue(HttpJwksSource.maxAgeOf("no-cache, max-age=60") == 0L);
+        Assert.isTrue(HttpJwksSource.maxAgeOf("public") == -1L);
+        Assert.isTrue(HttpJwksSource.maxAgeOf(null) == -1L);
+        return;
+    }
+
+    private static #CognitoTokenVerifier verifier(FixtureJwksSource keys, ManualTimeSource clock) {
+        return heap CognitoTokenVerifier("us-east-1", "us-east-1_ExAmPlE12",
+            CognitoTokenVerifierTest.CLIENT, keys, clock);
+    }
+
+    private static #FixtureJwksSource source(String file, int64 maxAge) {
+        FixtureJwksSource keys = heap FixtureJwksSource(maxAge);
+        String doc #= CognitoTokenVerifierTest.fixture(file);
+        keys.then(doc);
+        return #keys;
+    }
+
+    // Fails unless verifying `file` is refused as INVALID_TOKEN naming `check`.
+    private static void refused(CognitoTokenVerifier v, String file, int32 use, String check) {
+        String token #= CognitoTokenVerifierTest.fixture(file);
+        try {
+            Claims c #= v.verify(token, use);
+        } catch (IdentityException e) {
+            Assert.isTrue(e.kind() == IdentityException.INVALID_TOKEN());
+            if (e.message.indexOf(check) < 0L) {
+                Assert.fail(file + ": refused, but not by the " + check + " check: " + e.message);
+            }
+            return;
+        }
+        Assert.fail(file + " verified; expected the " + check + " check to refuse it");
+        return;
+    }
+
+    private static #String fixture(String name) {
+        String root = System.env.get("COGNITO_FIXTURES");
+        if (root == null) {
+            Assert.fail("COGNITO_FIXTURES is not set; run through run-tests.sh");
+        }
+        String path #= root + "/" + name;
+        int8[] bytes #= File.readAllBytes(path);
+        if (bytes == null) {
+            Assert.fail("missing fixture " + path);
+        }
+        int32 n = (int32) bytes.count();
+        return heap String(#bytes, n);
+    }
+}

@@ -1,0 +1,209 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.codec.Base64;
+import cajeta.codec.Base64Exception;
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.concurrent.Lock;
+import cajeta.concurrent.LockGuard;
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.Claims;
+import dev.cajeta.cloud.identity.DecodedJwt;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.Jwks;
+import dev.cajeta.cloud.identity.Jwt;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.identity.TokenUse;
+import dev.cajeta.cloud.identity.TokenVerifier;
+
+/**
+ * Verifies a Cognito user pool's tokens offline (identity spec §5.3, §14.4):
+ * the key by `kid`, the RS256 signature, the issuer
+ * `https://cognito-idp.<region>.amazonaws.com/<poolId>`, the token use, the
+ * audience (`client_id` on an access token, `aud` on an id token) and the
+ * expiry. A failure is INVALID_TOKEN naming the check. Groups come from
+ * `cognito:groups`.
+ *
+ * The JWKS is cached for its `Cache-Control` max-age, an hour when the
+ * response gives none. An unknown `kid` refetches the keys once, since pools
+ * rotate keys, then refuses; further unknown kids within a minute cost no
+ * fetch, so a stream of forged tokens cannot drive one fetch each.
+ * Revocation is invisible offline: a revoked token verifies until `exp`.
+ */
+public final class CognitoTokenVerifier implements TokenVerifier {
+    private static final int64 DEFAULT_MAX_AGE = 3600L;
+    private static final int64 MISS_COOLDOWN = 60L;
+
+    String issuer;
+    String clientId;
+    JwksSource source;
+    TimeSource clock;
+    Lock lock;
+    String keysDoc;
+    int64 keysExpireAt;
+    int64 lastMissFetch;
+    boolean missFetched;
+
+    public CognitoTokenVerifier(String region, String userPoolId, String clientId,
+                                JwksSource source, TimeSource clock) {
+        this.issuer #= CognitoTokenVerifier.issuerFor(region, userPoolId);
+        this.clientId = "" + clientId;
+        this.source #= source;
+        this.clock #= clock;
+        this.lock = heap Lock();
+        this.keysDoc = null;
+        this.keysExpireAt = 0L;
+        this.lastMissFetch = 0L;
+        this.missFetched = false;
+        return;
+    }
+
+    public static #String issuerFor(String region, String userPoolId) {
+        return "https://cognito-idp." + region + ".amazonaws.com/" + userPoolId;
+    }
+
+    public static #String jwksUrlFor(String region, String userPoolId) {
+        return "https://cognito-idp." + region + ".amazonaws.com/" + userPoolId
+            + "/.well-known/jwks.json";
+    }
+
+    public #Claims verify(String token, int32 expectedUse) {
+        LockGuard g #= this.lock.acquire();
+        DecodedJwt d #= Jwt.decode(token, "cognito", "verify");
+        d.requireAsymmetric("cognito", "verify");
+        String alg #= d.alg();
+        if (!alg.equals("RS256")) {
+            CognitoTokenVerifier.bad("-", "algorithm");
+        }
+        this.ensureFresh();
+        String kid #= d.kid();
+        if (!this.hasKid(kid)) {
+            int64 now = this.clock.nowSeconds();
+            if (!this.missFetched || now - this.lastMissFetch >= CognitoTokenVerifier.MISS_COOLDOWN) {
+                this.missFetched = true;
+                this.lastMissFetch = now;
+                this.refresh();
+            }
+            if (!this.hasKid(kid)) {
+                CognitoTokenVerifier.bad("-", "key");
+            }
+        }
+        Jwks keys = heap Jwks(this.keysDoc);
+        if (!d.verifiedBy(keys)) {
+            CognitoTokenVerifier.bad("-", "signature");
+        }
+        Claims c #= d.claims();
+        String sub #= c.subject();
+        String iss #= c.issuer();
+        if (!iss.equals(this.issuer)) {
+            CognitoTokenVerifier.bad(sub, "issuer");
+        }
+        if (c.tokenUse() != expectedUse) {
+            CognitoTokenVerifier.bad(sub, "use");
+        }
+        String audience = "aud";
+        if (expectedUse == TokenUse.ACCESS()) audience = "client_id";
+        String aud #= c.claim(audience);
+        if (!aud.equals(this.clientId)) {
+            CognitoTokenVerifier.bad(sub, "audience");
+        }
+        if (c.expiresAt() <= this.clock.nowSeconds()) {
+            CognitoTokenVerifier.bad(sub, "expiry");
+        }
+        return CognitoTokenVerifier.withCognitoGroups(c, token);
+    }
+
+    public #Jwks jwks() {
+        LockGuard g #= this.lock.acquire();
+        this.ensureFresh();
+        return heap Jwks(this.keysDoc);
+    }
+
+    // Fetch when nothing is cached or the cached document has expired.
+    private void ensureFresh() {
+        if (this.keysDoc == null || this.clock.nowSeconds() >= this.keysExpireAt) {
+            this.refresh();
+        }
+    }
+
+    private void refresh() {
+        JwksDocument doc #= this.source.fetch();
+        this.keysDoc #= doc.json();
+        int64 age = doc.maxAge();
+        if (age < 0L) age = CognitoTokenVerifier.DEFAULT_MAX_AGE;
+        this.keysExpireAt = this.clock.nowSeconds() + age;
+    }
+
+    private boolean hasKid(String kid) {
+        if (this.keysDoc == null || kid.byteLength() == 0) return false;
+        try {
+            JsonValue root #= Json.parse(this.keysDoc);
+            if (root.kind() != JsonValue.OBJECT) return false;
+            JsonValue list = root.object().get("keys");
+            if (list == null || list.kind() != JsonValue.ARRAY) return false;
+            JsonArray arr = list.array();
+            for (int32 i = 0; i < arr.count(); i++) {
+                JsonValue k = arr.get(i);
+                if (k.kind() != JsonValue.OBJECT) continue;
+                JsonValue id = k.object().get("kid");
+                if (id == null || id.kind() != JsonValue.STRING) continue;
+                String s #= id.asString();
+                if (s.equals(kid)) return true;
+            }
+        } catch (JsonParseException e) {
+            return false;
+        }
+        return false;
+    }
+
+    private static void bad(String subject, String check) {
+        throw heap IdentityException(IdentityException.INVALID_TOKEN(), "cognito",
+            "verify", subject, "token failed the " + check + " check");
+    }
+
+    // The port's claims with Cognito's `cognito:groups` as the groups. The
+    // token has already verified, so its payload parses.
+    private static #Claims withCognitoGroups(Claims c, String token) {
+        Attributes all = heap Attributes();
+        ArrayList<String> groups = heap ArrayList<String>();
+        int64 a = token.indexOf(".");
+        int64 b = token.indexOfFrom(".", a + 1L);
+        String seg #= token.substring((int32) (a + 1L), (int32) b);
+        try {
+            int8[] payload #= Base64.decode(seg);
+            JsonValue root #= Json.parse(payload, payload.count());
+            JsonObject o = root.object();
+            for (int32 i = 0; i < o.count(); i++) {
+                int32 kl = o.keyLenAt(i);
+                int8[] kb = heap int8[kl < 1 ? 1 : kl];
+                int8[] raw = o.keyAt(i);
+                for (int32 j = 0; j < kl; j++) kb[j] = raw[j];
+                String name = heap String(#kb, kl);
+                if (c.has(name)) {
+                    String value #= c.claim(name);
+                    all.set(name, value);
+                }
+            }
+            JsonValue list = o.get("cognito:groups");
+            if (list != null && list.kind() == JsonValue.ARRAY) {
+                JsonArray arr = list.array();
+                for (int32 i = 0; i < arr.count(); i++) {
+                    JsonValue gv = arr.get(i);
+                    if (gv.kind() != JsonValue.STRING) continue;
+                    String gname #= JsonText.unescape(gv.asBytes(), gv.asBytesLength());
+                    groups.add(#gname);
+                }
+            }
+        } catch (Base64Exception e) {
+            CognitoTokenVerifier.bad("-", "structure");
+        } catch (JsonParseException e) {
+            CognitoTokenVerifier.bad("-", "structure");
+        }
+        return heap Claims(#all, #groups, c.tokenUse(), c.expiresAt(), c.issuedAt());
+    }
+}
