@@ -35,7 +35,7 @@ sha256_of() {
 }
 
 # The version cajeta.json pins for <name>: dependencies, dev-dependencies, or
-# overrides (codec is an override; see the note in cajeta.json).
+# overrides.
 pin_of() {
     python3 -c 'import json,re,sys
 t=re.sub(r"(?m)^\s*//.*$","",open(sys.argv[1]).read())

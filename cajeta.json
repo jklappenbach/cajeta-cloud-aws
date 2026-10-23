@@ -18,24 +18,19 @@
 
     "settings": {
         "toolchain": {
-            "version": "0.44.0"
+            "version": "0.46.3"
         },
 
         "capabilities": ["env", "filesystem", "network"],
 
+        // codec 0.9.1 (the XML reader) and crypto 0.1.1 (its skills) are
+        // direct dependencies. http 0.9.1 asks for codec 0.8.7 and crypto
+        // 0.1.0, and cloud 0.4.1 for crypto 0.1.0; since cajeta 0.46.3 a bare
+        // version is a floor within its major, so the resolver takes the
+        // highest of the floors.
         "dependencies": {
             "dev.cajeta.cloud":  "0.4.1",
-            "dev.cajeta.http":   "0.9.1"
-        },
-
-        // codec 0.9.1 (the XML reader) and crypto 0.1.1 (its skills) come in
-        // as overrides, not direct dependencies: http 0.9.1 pins codec 0.8.7
-        // and crypto 0.1.0 exactly, cloud 0.4.1 pins crypto 0.1.0, and the
-        // resolver applies an override only to a package that is not also a
-        // direct dependency, so direct pins do not resolve. Both are additive
-        // over what http and cloud pin. Make them direct again once those pin
-        // the same versions.
-        "overrides": {
+            "dev.cajeta.http":   "0.9.1",
             "dev.cajeta.codec":  "0.9.1",
             "dev.cajeta.crypto": "0.1.1"
         },
