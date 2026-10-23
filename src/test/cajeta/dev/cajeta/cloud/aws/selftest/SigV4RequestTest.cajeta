@@ -1,0 +1,109 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.http.Bytes;
+import dev.cajeta.http.ClientRequest;
+import dev.cajeta.http.body.BytesBody;
+import dev.cajeta.cloud.aws.AwsCredentials;
+import dev.cajeta.cloud.aws.SigV4Signer;
+
+/**
+ * `SigV4Signer.sign` on a `ClientRequest` (plan 2.1.3). The two S3 cases are
+ * the worked examples in AWS's S3 documentation ("Signature Calculations for
+ * the Authorization Header: Transferring Payload in a Single Chunk"): GET
+ * Object with a Range, and PUT Object with a buffered body, signed at
+ * 2013-05-24T00:00:00Z. Their signatures were also recomputed independently
+ * with Python's hmac/hashlib before being fixed here.
+ */
+public class SigV4RequestTest {
+    private static final String EMPTY_SHA256 =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    private static final int64 MAY_24_2013 = 1369353600L;
+
+    public SigV4RequestTest() {
+        return;
+    }
+
+    @Test
+    public void s3GetObjectExampleSignsAsPublished() {
+        ClientRequest req #= ClientRequest.get("https://examplebucket.s3.amazonaws.com/test.txt");
+        req.header("Range", "bytes=0-9");
+        SigV4Signer signer = heap SigV4Signer("us-east-1", "s3");
+        AwsCredentials creds #= SigV4RequestTest.exampleKey();
+        signer.sign(req, creds, SigV4RequestTest.MAY_24_2013);
+
+        Assert.isTrue(Bytes.equals(req.header("X-Amz-Content-Sha256"), SigV4RequestTest.EMPTY_SHA256));
+        Assert.isTrue(Bytes.equals(req.header("X-Amz-Date"), "20130524T000000Z"));
+        Assert.isTrue(Bytes.equals(req.header("Host"), "examplebucket.s3.amazonaws.com"));
+        Assert.isTrue(Bytes.contains(req.header("Authorization"),
+            "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"));
+        Assert.isTrue(Bytes.contains(req.header("Authorization"),
+            "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date"));
+        Assert.isTrue(Bytes.contains(req.header("Authorization"),
+            "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"));
+        return;
+    }
+
+    @Test
+    public void s3PutObjectExampleHashesTheBufferedBody() {
+        ClientRequest req #= ClientRequest.of("PUT",
+            "https://examplebucket.s3.amazonaws.com/test$file.text");
+        req.header("Date", "Fri, 24 May 2013 00:00:00 GMT");
+        req.header("x-amz-storage-class", "REDUCED_REDUNDANCY");
+        req.body("Welcome to Amazon S3.");
+        SigV4Signer signer = heap SigV4Signer("us-east-1", "s3");
+        AwsCredentials creds #= SigV4RequestTest.exampleKey();
+        signer.sign(req, creds, SigV4RequestTest.MAY_24_2013);
+
+        Assert.isTrue(Bytes.equals(req.header("X-Amz-Content-Sha256"),
+            "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072"));
+        Assert.isTrue(Bytes.contains(req.header("Authorization"),
+            "SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class"));
+        Assert.isTrue(Bytes.contains(req.header("Authorization"),
+            "Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"));
+        return;
+    }
+
+    @Test
+    public void aStreamedBodyIsSignedAsUnsignedPayload() {
+        ClientRequest req #= ClientRequest.of("PUT", "https://examplebucket.s3.amazonaws.com/big.bin");
+        int8[] data = heap int8[4];
+        req.body(#BytesBody.of(#data, 4));
+        SigV4Signer signer = heap SigV4Signer("us-east-1", "s3");
+        AwsCredentials creds #= SigV4RequestTest.exampleKey();
+        signer.sign(req, creds, SigV4RequestTest.MAY_24_2013);
+
+        Assert.isTrue(Bytes.equals(req.header("X-Amz-Content-Sha256"), "UNSIGNED-PAYLOAD"));
+        return;
+    }
+
+    @Test
+    public void aTemporaryKeySendsItsSessionToken() {
+        ClientRequest req #= ClientRequest.get("https://examplebucket.s3.amazonaws.com/test.txt");
+        SigV4Signer signer = heap SigV4Signer("us-east-1", "s3");
+        AwsCredentials creds = heap AwsCredentials("AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "session-token-example");
+        signer.sign(req, creds, SigV4RequestTest.MAY_24_2013);
+
+        Assert.isTrue(Bytes.equals(req.header("X-Amz-Security-Token"), "session-token-example"));
+        Assert.isTrue(Bytes.contains(req.header("Authorization"), "x-amz-security-token"));
+        return;
+    }
+
+    @Test
+    public void credentialsNameOnlyTheKeyId() {
+        AwsCredentials creds = heap AwsCredentials("AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "session-token-example");
+        String shown #= creds.toString();
+        Assert.isTrue(shown.indexOf("AKIAIOSFODNN7EXAMPLE") >= 0L);
+        Assert.isTrue(shown.indexOf("bPxRfiCY") < 0L);
+        Assert.isTrue(shown.indexOf("session-token") < 0L);
+        return;
+    }
+
+    private static #AwsCredentials exampleKey() {
+        return heap AwsCredentials("AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", null);
+    }
+}

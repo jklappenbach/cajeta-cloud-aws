@@ -1,0 +1,181 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.lang.String;
+import cajeta.io.file.File;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.aws.AwsCredentials;
+import dev.cajeta.cloud.aws.SigV4Signer;
+import dev.cajeta.cloud.aws.SigningHeaders;
+
+/**
+ * AWS's published SigV4 test-suite vectors (plan 2.1.1), vendored from
+ * awslabs/aws-c-auth at 84a26ea184d9 under src/test/resources/sigv4. Every case
+ * signs with the suite's example key at 2015-08-30T12:36:00Z, region us-east-1,
+ * service "service", and checks the canonical request, the string to sign and
+ * the signature against the published files. run-tests.sh exports
+ * AWS_SIGV4_VECTORS as that directory.
+ */
+public class SigV4VectorTest {
+
+    public SigV4VectorTest() {
+        return;
+    }
+
+    @Test
+    public void getVanilla() {
+        SigV4VectorTest.check("get-vanilla", false, false);
+        return;
+    }
+
+    @Test
+    public void postXWwwFormUrlencoded() {
+        SigV4VectorTest.check("post-x-www-form-urlencoded", false, true);
+        return;
+    }
+
+    @Test
+    public void getHeaderValueTrim() {
+        SigV4VectorTest.check("get-header-value-trim", false, false);
+        return;
+    }
+
+    @Test
+    public void postVanillaQuery() {
+        SigV4VectorTest.check("post-vanilla-query", false, false);
+        return;
+    }
+
+    @Test
+    public void getUtf8() {
+        SigV4VectorTest.check("get-utf8", false, false);
+        return;
+    }
+
+    @Test
+    public void getVanillaWithSessionToken() {
+        SigV4VectorTest.check("get-vanilla-with-session-token", true, false);
+        return;
+    }
+
+    @Test
+    public void getVanillaQueryOrderKeyCase() {
+        SigV4VectorTest.check("get-vanilla-query-order-key-case", false, false);
+        return;
+    }
+
+    @Test
+    public void getVanillaQueryUnreserved() {
+        SigV4VectorTest.check("get-vanilla-query-unreserved", false, false);
+        return;
+    }
+
+    @Test
+    public void postHeaderKeySort() {
+        SigV4VectorTest.check("post-header-key-sort", false, false);
+        return;
+    }
+
+    @Test
+    public void postHeaderValueCase() {
+        SigV4VectorTest.check("post-header-value-case", false, false);
+        return;
+    }
+
+    @Test
+    public void getHeaderKeyDuplicate() {
+        SigV4VectorTest.check("get-header-key-duplicate", false, false);
+        return;
+    }
+
+    @Test
+    public void amzDateFormatsTheSuiteTimestamp() {
+        // 2015-08-30T12:36:00Z
+        Assert.equals("20150830T123600Z", SigV4Signer.amzDate(1440938160L));
+        Assert.equals("20000229T000000Z", SigV4Signer.amzDate(951782400L));
+        return;
+    }
+
+    // Parses the case's request.txt, signs it, and compares the three published
+    // artifacts byte for byte.
+    private static void check(String name, boolean withToken, boolean signBody) {
+        String dir #= SigV4VectorTest.caseDir(name);
+        String request #= SigV4VectorTest.readText(dir + "/request.txt");
+        String expectCanonical #= SigV4VectorTest.readText(dir + "/header-canonical-request.txt");
+        String expectStringToSign #= SigV4VectorTest.readText(dir + "/header-string-to-sign.txt");
+        String expectSignature #= SigV4VectorTest.readText(dir + "/header-signature.txt");
+
+        AwsCredentials creds #= SigV4VectorTest.credentials(withToken);
+        SigV4Signer signer = heap SigV4Signer("us-east-1", "service");
+
+        // request.txt: "METHOD target HTTP/1.1", then "Name:value" lines, a
+        // blank line, and the body.
+        int64 eol = request.indexOf("\n");
+        String firstLine #= request.substring(0, (int32) eol);
+        int64 sp1 = firstLine.indexOf(" ");
+        int64 sp2 = firstLine.indexOfFrom(" HTTP/", sp1 + 1L);
+        String method #= firstLine.substring(0, (int32) sp1);
+        String target #= firstLine.substring((int32) (sp1 + 1L), (int32) sp2);
+        int64 q = target.indexOf("?");
+        String path #= q < 0L ? target.substring(0, (int32) target.byteLength())
+                              : target.substring(0, (int32) q);
+        String query #= q < 0L ? heap String()
+                               : target.substring((int32) (q + 1L), (int32) target.byteLength());
+
+        SigningHeaders headers = heap SigningHeaders();
+        int64 at = eol + 1L;
+        String body #= heap String();
+        while (at < request.byteLength()) {
+            int64 next = request.indexOfFrom("\n", at);
+            if (next < 0L) next = request.byteLength();
+            if (next == at) {
+                body #= request.substring((int32) (at + 1L), (int32) request.byteLength());
+                break;
+            }
+            String line #= request.substring((int32) at, (int32) next);
+            int64 colon = line.indexOf(":");
+            String hn #= line.substring(0, (int32) colon);
+            String hv #= line.substring((int32) (colon + 1L), (int32) line.byteLength());
+            headers.add(hn, hv);
+            at = next + 1L;
+        }
+
+        String amzDate #= SigV4Signer.amzDate(1440938160L);
+        String payloadHash #= SigV4Signer.payloadHash(body);
+        signer.addSigningHeaders(headers, amzDate, creds, payloadHash, signBody);
+
+        String canonical #= signer.canonicalRequest(method, path, query, headers, payloadHash);
+        Assert.equals(expectCanonical, canonical);
+        String toSign #= signer.stringToSign(amzDate, canonical);
+        Assert.equals(expectStringToSign, toSign);
+        String signature #= signer.signature(creds, amzDate, toSign);
+        Assert.equals(expectSignature, signature);
+        return;
+    }
+
+    private static #AwsCredentials credentials(boolean withToken) {
+        if (withToken) {
+            return heap AwsCredentials("AKIDEXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267");
+        }
+        return heap AwsCredentials("AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", null);
+    }
+
+    private static #String caseDir(String name) {
+        String root = System.env.get("AWS_SIGV4_VECTORS");
+        if (root == null) {
+            Assert.fail("AWS_SIGV4_VECTORS is not set; run through run-tests.sh");
+        }
+        return root + "/" + name;
+    }
+
+    private static #String readText(String path) {
+        int8[] bytes #= File.readAllBytes(path);
+        if (bytes == null) {
+            Assert.fail("missing vector file " + path);
+        }
+        int32 n = (int32) bytes.count();
+        return heap String(#bytes, n);
+    }
+}

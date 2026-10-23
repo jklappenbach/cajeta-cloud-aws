@@ -1,0 +1,41 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+import cajeta.collection.ArrayList;
+
+/**
+ * The header fields a SigV4 signature covers, in arrival order. Names keep
+ * their case here; the signer lowercases, trims and merges duplicates when it
+ * builds the canonical request.
+ */
+public final class SigningHeaders {
+    private ArrayList<String> names;
+    private ArrayList<String> values;
+
+    public SigningHeaders() {
+        this.names #= heap ArrayList<String>();
+        this.values #= heap ArrayList<String>();
+        return;
+    }
+
+    /** Appends one field; a repeated name is merged at signing, in order. */
+    public void add(String name, String value) {
+        String n #= name;
+        String v #= value;
+        this.names.add(#n);
+        this.values.add(#v);
+        return;
+    }
+
+    public int32 count() {
+        return this.names.count();
+    }
+
+    public String nameAt(int32 i) {
+        return this.names.get(i);
+    }
+
+    public String valueAt(int32 i) {
+        return this.values.get(i);
+    }
+}

@@ -1,0 +1,431 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+import cajeta.lang.Slice;
+import cajeta.lang.StringBuilder;
+import cajeta.collection.ArrayList;
+import dev.cajeta.crypto.HmacSha256;
+import dev.cajeta.crypto.Sha256;
+import dev.cajeta.http.Bytes;
+import dev.cajeta.http.ClientRequest;
+
+/**
+ * AWS Signature Version 4 over cajeta-http's `ClientRequest` (spec 2.2):
+ * canonical request, string to sign, and the signing key derived through
+ * HMAC-SHA256 from the date, region, service and "aws4_request".
+ *
+ * The parts are public so AWS's published test-suite vectors can check each
+ * one (`SigV4VectorTest`); `sign` puts them together on a request.
+ *
+ * S3 differs from every other service in two places, both decided by the
+ * service name: its path is encoded once and never normalized (a key may hold
+ * "//" or "."), while other services normalize the path and encode it again.
+ */
+public final class SigV4Signer {
+    public static final String UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
+    private static final String ALGORITHM = "AWS4-HMAC-SHA256";
+    private static final String HEX = "0123456789ABCDEF";
+
+    private String region;
+    private String service;
+    private boolean s3;
+
+    public SigV4Signer(String region, String service) {
+        this.region #= region;
+        this.service #= service;
+        this.s3 = service.equals("s3");
+        return;
+    }
+
+    // ─── the request adapter ────────────────────────────────────────────
+
+    /**
+     * Signs `req` at `epochSeconds`: sets Host when absent, X-Amz-Date,
+     * X-Amz-Content-Sha256, X-Amz-Security-Token for a temporary key, and
+     * Authorization. A buffered body is hashed; a streamed one is signed as
+     * UNSIGNED-PAYLOAD.
+     */
+    public void sign(ClientRequest req, AwsCredentials creds, int64 epochSeconds) {
+        String amz #= SigV4Signer.amzDate(epochSeconds);
+        String payload #= SigV4Signer.requestPayloadHash(req);
+        if (!req.hasHeader("Host")) {
+            req.setHeader("Host", req.authority());
+        }
+        req.setHeader("X-Amz-Date", amz);
+        req.setHeader("X-Amz-Content-Sha256", payload);
+        if (creds.hasSessionToken()) {
+            req.setHeader("X-Amz-Security-Token", creds.sessionToken());
+        }
+
+        SigningHeaders headers = heap SigningHeaders();
+        int32 n = req.fieldCount();
+        for (int32 i = 0; i < n; i++) {
+            if (!req.fieldLive(i)) continue;
+            String hn #= Bytes.toString(req.nameAt(i));
+            String hv #= Bytes.toString(req.valueAt(i));
+            headers.add(hn, hv);
+        }
+
+        String target #= Bytes.toString(req.target());
+        int64 q = target.indexOf("?");
+        String path #= q < 0L ? target.substring(0, (int32) target.byteLength())
+                              : target.substring(0, (int32) q);
+        String query #= q < 0L ? heap String()
+                               : target.substring((int32) (q + 1L), (int32) target.byteLength());
+
+        String canonical #= this.canonicalRequest(req.methodToken(), path, query, headers, payload);
+        String toSign #= this.stringToSign(amz, canonical);
+        String sig #= this.signature(creds, amz, toSign);
+        String auth #= SigV4Signer.ALGORITHM + " Credential=" + creds.accessKeyId() + "/"
+            + this.credentialScope(amz) + ", SignedHeaders=" + this.signedHeaders(headers)
+            + ", Signature=" + sig;
+        req.setHeader("Authorization", auth);
+        return;
+    }
+
+    /**
+     * The X-Amz-Content-Sha256 value for `req`: UNSIGNED-PAYLOAD for a streamed
+     * body, else the hex SHA-256 of the buffered body (of no bytes when empty).
+     */
+    public static #String requestPayloadHash(ClientRequest req) {
+        if (req.bodyStream() != null) {
+            return SigV4Signer.copyOf(SigV4Signer.UNSIGNED_PAYLOAD);
+        }
+        if (!req.hasBody() || req.bodyLength() == 0) {
+            return SigV4Signer.payloadHash("");
+        }
+        int8[] body #= Bytes.copyOf(req.body());
+        return Sha256.hashHex(body, (int64) req.bodyLength());
+    }
+
+    /** The hex SHA-256 of `body`'s bytes. */
+    public static #String payloadHash(String body) {
+        return Sha256.hashStringHex(body);
+    }
+
+    /** Adds X-Amz-Date, the session token when there is one, and, when
+     *  `contentHeader`, X-Amz-Content-Sha256. */
+    public void addSigningHeaders(SigningHeaders h, String amzDate, AwsCredentials creds,
+                                  String payloadHash, boolean contentHeader) {
+        if (contentHeader) h.add("X-Amz-Content-Sha256", payloadHash);
+        h.add("X-Amz-Date", amzDate);
+        if (creds.hasSessionToken()) h.add("X-Amz-Security-Token", creds.sessionToken());
+        return;
+    }
+
+    // ─── the four published artifacts ───────────────────────────────────
+
+    public #String canonicalRequest(String method, String path, String query,
+                                    SigningHeaders headers, String payloadHash) {
+        SigningHeaders merged #= SigV4Signer.mergeHeaders(headers);
+        StringBuilder b = heap StringBuilder();
+        b.append(method);
+        b.append("\n");
+        String cp #= this.canonicalPath(path);
+        b.append(cp);
+        b.append("\n");
+        String cq #= SigV4Signer.canonicalQuery(query);
+        b.append(cq);
+        b.append("\n");
+        int32 n = merged.count();
+        for (int32 i = 0; i < n; i++) {
+            b.append(merged.nameAt(i));
+            b.append(":");
+            b.append(merged.valueAt(i));
+            b.append("\n");
+        }
+        b.append("\n");
+        String signed #= SigV4Signer.joinNames(merged);
+        b.append(signed);
+        b.append("\n");
+        b.append(payloadHash);
+        return b.toString();
+    }
+
+    public #String stringToSign(String amzDate, String canonicalRequest) {
+        String hash #= Sha256.hashStringHex(canonicalRequest);
+        return SigV4Signer.ALGORITHM + "\n" + amzDate + "\n" + this.credentialScope(amzDate) + "\n" + hash;
+    }
+
+    /** The hex signature of `stringToSign` under the key derived for the date. */
+    public #String signature(AwsCredentials creds, String amzDate, String stringToSign) {
+        String day #= amzDate.substring(0, 8);
+        String seed #= "AWS4" + creds.secretAccessKey();
+        int8[] k0 #= SigV4Signer.bytesOf(seed);
+        int8[] k1 #= SigV4Signer.hmac(k0, day);
+        int8[] k2 #= SigV4Signer.hmac(k1, this.region);
+        int8[] k3 #= SigV4Signer.hmac(k2, this.service);
+        int8[] k4 #= SigV4Signer.hmac(k3, "aws4_request");
+        int8[] msg #= SigV4Signer.bytesOf(stringToSign);
+        return HmacSha256.macHex(k4, 32L, msg, msg.count());
+    }
+
+    /** "20150830/us-east-1/service/aws4_request" for `amzDate`. */
+    public #String credentialScope(String amzDate) {
+        String day #= amzDate.substring(0, 8);
+        return day + "/" + this.region + "/" + this.service + "/aws4_request";
+    }
+
+    /** "host;x-amz-date" for these headers: lowercased, merged, sorted. */
+    public #String signedHeaders(SigningHeaders headers) {
+        SigningHeaders merged #= SigV4Signer.mergeHeaders(headers);
+        return SigV4Signer.joinNames(merged);
+    }
+
+    /** ISO 8601 basic UTC, "20150830T123600Z", for seconds since the epoch. */
+    public static #String amzDate(int64 epochSeconds) {
+        int64 days = epochSeconds / 86400L;
+        int64 secs = epochSeconds - days * 86400L;
+        // Civil date from days since 1970-01-01 (H. Hinnant's algorithm).
+        int64 z = days + 719468L;
+        int64 era = z / 146097L;
+        int64 doe = z - era * 146097L;
+        int64 yoe = (doe - doe / 1460L + doe / 36524L - doe / 146096L) / 365L;
+        int64 y = yoe + era * 400L;
+        int64 doy = doe - (365L * yoe + yoe / 4L - yoe / 100L);
+        int64 mp = (5L * doy + 2L) / 153L;
+        int64 d = doy - (153L * mp + 2L) / 5L + 1L;
+        int64 m = mp < 10L ? mp + 3L : mp - 9L;
+        if (m <= 2L) y = y + 1L;
+        String mm #= SigV4Signer.two(m);
+        String dd #= SigV4Signer.two(d);
+        String hh #= SigV4Signer.two(secs / 3600L);
+        String mi #= SigV4Signer.two((secs / 60L) % 60L);
+        String ss #= SigV4Signer.two(secs % 60L);
+        return "" + y + mm + dd + "T" + hh + mi + ss + "Z";
+    }
+
+    // ─── canonical parts ────────────────────────────────────────────────
+
+    private #String canonicalPath(String path) {
+        if (path.byteLength() == 0L) {
+            return SigV4Signer.copyOf("/");
+        }
+        if (this.s3) {
+            String raw #= SigV4Signer.percentDecode(path);
+            return SigV4Signer.uriEncode(raw, true);
+        }
+        String normal #= SigV4Signer.normalizePath(path);
+        return SigV4Signer.uriEncode(normal, true);
+    }
+
+    // Sorted "k=v" pairs, each side decoded then encoded once.
+    private static #String canonicalQuery(String query) {
+        ArrayList<String> pairs = heap ArrayList<String>();
+        int64 at = 0L;
+        int64 n = query.byteLength();
+        while (at < n) {
+            int64 amp = query.indexOfFrom("&", at);
+            if (amp < 0L) amp = n;
+            if (amp > at) {
+                String piece #= query.substring((int32) at, (int32) amp);
+                int64 eq = piece.indexOf("=");
+                String rk #= eq < 0L ? piece.substring(0, (int32) piece.byteLength())
+                                     : piece.substring(0, (int32) eq);
+                String rv #= eq < 0L ? heap String()
+                                     : piece.substring((int32) (eq + 1L), (int32) piece.byteLength());
+                String dk #= SigV4Signer.percentDecode(rk);
+                String dv #= SigV4Signer.percentDecode(rv);
+                String ek #= SigV4Signer.uriEncode(dk, false);
+                String ev #= SigV4Signer.uriEncode(dv, false);
+                String pair #= ek + "=" + ev;
+                pairs.add(#pair);
+            }
+            at = amp + 1L;
+        }
+        // Insertion sort: "k=v" orders by key, then value, because "=" sorts
+        // below every encoded character.
+        int32 c = pairs.count();
+        for (int32 i = 1; i < c; i++) {
+            int32 j = i;
+            while (j > 0 && pairs.get(j - 1).compareTo(pairs.get(j)) > 0) {
+                String hi #= pairs.removeAt(j - 1);
+                pairs.insert(j, #hi);
+                j = j - 1;
+            }
+        }
+        StringBuilder b = heap StringBuilder();
+        for (int32 i = 0; i < c; i++) {
+            if (i > 0) b.append("&");
+            b.append(pairs.get(i));
+        }
+        return b.toString();
+    }
+
+    // Lowercased names, trimmed and space-collapsed values, duplicates joined
+    // with "," in arrival order, sorted by name. Authorization and the fields a
+    // proxy may rewrite (User-Agent, Expect, X-Amzn-Trace-Id) are not signed.
+    private static #SigningHeaders mergeHeaders(SigningHeaders h) {
+        ArrayList<String> names = heap ArrayList<String>();
+        ArrayList<String> values = heap ArrayList<String>();
+        int32 n = h.count();
+        for (int32 i = 0; i < n; i++) {
+            String ln #= h.nameAt(i).toLowerCase();
+            if (ln.equals("authorization") || ln.equals("user-agent")
+                || ln.equals("expect") || ln.equals("x-amzn-trace-id")) continue;
+            String v #= SigV4Signer.trimCollapse(h.valueAt(i));
+            int32 found = -1;
+            for (int32 k = 0; k < names.count(); k++) {
+                if (names.get(k).equals(ln)) { found = k; break; }
+            }
+            if (found >= 0) {
+                String joined #= values.get(found) + "," + v;
+                values.set(found, #joined);
+            } else {
+                names.add(#ln);
+                values.add(#v);
+            }
+        }
+        int32 c = names.count();
+        for (int32 i = 1; i < c; i++) {
+            int32 j = i;
+            while (j > 0 && names.get(j - 1).compareTo(names.get(j)) > 0) {
+                String hn #= names.removeAt(j - 1);
+                String hv #= values.removeAt(j - 1);
+                names.insert(j, #hn);
+                values.insert(j, #hv);
+                j = j - 1;
+            }
+        }
+        SigningHeaders out = heap SigningHeaders();
+        for (int32 i = 0; i < c; i++) {
+            out.add(names.get(i), values.get(i));
+        }
+        return #out;
+    }
+
+    private static #String joinNames(SigningHeaders merged) {
+        StringBuilder b = heap StringBuilder();
+        int32 n = merged.count();
+        for (int32 i = 0; i < n; i++) {
+            if (i > 0) b.append(";");
+            b.append(merged.nameAt(i));
+        }
+        return b.toString();
+    }
+
+    // Removes "." and ".." segments and empty segments; keeps a trailing "/".
+    private static #String normalizePath(String path) {
+        ArrayList<String> segs = heap ArrayList<String>();
+        int64 n = path.byteLength();
+        int64 at = 0L;
+        while (at <= n) {
+            int64 slash = path.indexOfFrom("/", at);
+            if (slash < 0L) slash = n;
+            if (slash > at) {
+                String seg #= path.substring((int32) at, (int32) slash);
+                if (seg.equals("..")) {
+                    if (segs.count() > 0) {
+                        String dropped #= segs.removeAt(segs.count() - 1);
+                    }
+                } else if (!seg.equals(".")) {
+                    segs.add(#seg);
+                }
+            }
+            at = slash + 1L;
+        }
+        StringBuilder b = heap StringBuilder();
+        for (int32 i = 0; i < segs.count(); i++) {
+            b.append("/");
+            b.append(segs.get(i));
+        }
+        boolean trailing = n > 1L && path.byteAt((int32) (n - 1L)) == (int8) 47;
+        if (segs.count() == 0 || trailing) b.append("/");
+        return b.toString();
+    }
+
+    // RFC 3986 unreserved bytes pass; every other byte is %XX in upper case.
+    private static #String uriEncode(String s, boolean keepSlash) {
+        int32 n = (int32) s.byteLength();
+        int8[] out = heap int8[n * 3 + 1];
+        int32 w = 0;
+        for (int32 i = 0; i < n; i++) {
+            int8 b = s.byteAt(i);
+            int32 u = ((int32) b) & 255;
+            boolean plain = (u >= 65 && u <= 90) || (u >= 97 && u <= 122)
+                || (u >= 48 && u <= 57) || u == 45 || u == 46 || u == 95 || u == 126
+                || (keepSlash && u == 47);
+            if (plain) {
+                out[w] = b;
+                w = w + 1;
+            } else {
+                out[w] = (int8) 37;
+                out[w + 1] = SigV4Signer.HEX.byteAt(u >> 4);
+                out[w + 2] = SigV4Signer.HEX.byteAt(u & 15);
+                w = w + 3;
+            }
+        }
+        return heap String(#out, w);
+    }
+
+    private static #String percentDecode(String s) {
+        int32 n = (int32) s.byteLength();
+        int8[] out = heap int8[n + 1];
+        int32 w = 0;
+        int32 i = 0;
+        while (i < n) {
+            int8 b = s.byteAt(i);
+            if (b == (int8) 37 && i + 2 < n) {
+                int32 hi = Bytes.hexValue(((int32) s.byteAt(i + 1)) & 255);
+                int32 lo = Bytes.hexValue(((int32) s.byteAt(i + 2)) & 255);
+                if (hi >= 0 && lo >= 0) {
+                    out[w] = (int8) (hi * 16 + lo);
+                    w = w + 1;
+                    i = i + 3;
+                    continue;
+                }
+            }
+            out[w] = b;
+            w = w + 1;
+            i = i + 1;
+        }
+        return heap String(#out, w);
+    }
+
+    // One space between words, none at either end.
+    private static #String trimCollapse(String v) {
+        int32 n = (int32) v.byteLength();
+        int8[] out = heap int8[n + 1];
+        int32 w = 0;
+        boolean pending = false;
+        for (int32 i = 0; i < n; i++) {
+            int8 b = v.byteAt(i);
+            if (b == (int8) 32 || b == (int8) 9) {
+                pending = w > 0;
+                continue;
+            }
+            if (pending) {
+                out[w] = (int8) 32;
+                w = w + 1;
+                pending = false;
+            }
+            out[w] = b;
+            w = w + 1;
+        }
+        return heap String(#out, w);
+    }
+
+    private static #int8[] hmac(int8[] key, String data) {
+        int8[] msg #= SigV4Signer.bytesOf(data);
+        return HmacSha256.mac(key, key.count(), msg, msg.count());
+    }
+
+    private static #int8[] bytesOf(String s) {
+        int32 n = (int32) s.byteLength();
+        int8[] out = heap int8[n];
+        for (int32 i = 0; i < n; i++) out[i] = s.byteAt(i);
+        return #out;
+    }
+
+    // An owned copy of `s`, for an owned return of a literal or a constant.
+    private static #String copyOf(String s) {
+        int8[] b #= SigV4Signer.bytesOf(s);
+        int32 n = (int32) s.byteLength();
+        return heap String(#b, n);
+    }
+
+    private static #String two(int64 v) {
+        if (v < 10L) return "0" + v;
+        return "" + v;
+    }
+}
