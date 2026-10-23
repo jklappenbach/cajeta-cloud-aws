@@ -31,6 +31,27 @@ final class CognitoJson {
         return this;
     }
 
+    CognitoJson bool(String n, boolean value) {
+        this.name(n);
+        if (value) this.out.append("true");
+        else this.out.append("false");
+        return this;
+    }
+
+    CognitoJson num(String n, int64 value) {
+        this.name(n);
+        String t #= "" + value;
+        this.out.append(t);
+        return this;
+    }
+
+    /** A member whose value is already JSON text. */
+    CognitoJson raw(String n, String json) {
+        this.name(n);
+        this.out.append(json);
+        return this;
+    }
+
     /** Opens a nested object member; close() ends it. */
     CognitoJson open(String n) {
         this.name(n);

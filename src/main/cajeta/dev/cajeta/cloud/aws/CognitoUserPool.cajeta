@@ -1,0 +1,268 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.identity.Account;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.Authenticator;
+import dev.cajeta.cloud.identity.IdentityCapability;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.Jwt;
+import dev.cajeta.cloud.identity.RegistrationResult;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.identity.TokenVerifier;
+import dev.cajeta.cloud.identity.User;
+import dev.cajeta.cloud.identity.UserPool;
+
+/**
+ * A Cognito user pool behind the identity port (adapters spec 2.3, identity
+ * spec §14). Registration and confirmation are the public plane, unsigned
+ * and keyed by username. Lookup, deletion, attributes and groups are the
+ * administrative plane, SigV4-signed, keyed by subject: the adapter finds the
+ * username with `ListUsers` filtered on `sub` (eventually consistent, so a
+ * user registered a moment ago may not be found yet).
+ */
+public final class CognitoUserPool implements UserPool {
+    CognitoClient client;
+    String poolId;
+    TimeSource clock;
+    CognitoAuthenticator auth;
+    CognitoAccount acct;
+    CognitoTokenVerifier ver;
+    Capabilities caps;
+
+    CognitoUserPool(int32 bare) { return; }
+
+    /** A pool over the given client; the token verifier fetches the pool's JWKS over HTTPS. */
+    public static #CognitoUserPool over(#CognitoClient client, String userPoolId, #TimeSource clock) {
+        CognitoUserPool p = heap CognitoUserPool(0);
+        p.client #= client;
+        p.poolId = "" + userPoolId;
+        p.clock #= clock;
+        p.auth = heap CognitoAuthenticator(p.client, userPoolId, p.clock);
+        p.acct = heap CognitoAccount(p.client, userPoolId);
+        String region #= p.client.regionName();
+        String cid #= p.client.appClientId();
+        String url #= CognitoTokenVerifier.jwksUrlFor(region, userPoolId);
+        JwksSource keys = heap HttpJwksSource(url);
+        p.ver = heap CognitoTokenVerifier(region, userPoolId, cid, #keys, p.clock);
+        Capabilities c = heap Capabilities("cognito");
+        c.declare(IdentityCapability.CONFIRMATION(), "");
+        c.declare(IdentityCapability.CUSTOM_ATTRIBUTES(), "sent as custom:<name>; the pool must define each one");
+        c.declare(IdentityCapability.TOTP(), "");
+        c.declare(IdentityCapability.REFRESH(), "");
+        c.declare(IdentityCapability.JWKS(), "");
+        c.declare(IdentityCapability.PASSWORD_RESET(), "");
+        c.declare(IdentityCapability.REVOCATION(), "the app client must enable token revocation");
+        c.declare(IdentityCapability.GROUPS(), "needs AWS credentials");
+        c.declare(IdentityCapability.ADMIN(), "needs AWS credentials");
+        p.caps #= c;
+        return #p;
+    }
+
+    public Capabilities capabilities() { return this.caps; }
+    public Authenticator authenticator() { return this.auth; }
+    public Account account() { return this.acct; }
+    public TokenVerifier verifier() { return this.ver; }
+
+    public #RegistrationResult register(String username, String password) {
+        Attributes none = heap Attributes();
+        return this.registerWith(username, password, none);
+    }
+
+    public #RegistrationResult registerWith(String username, String password, Attributes attributes) {
+        CognitoJson j = heap CognitoJson();
+        String cid #= this.client.appClientId();
+        j.str("ClientId", cid);
+        j.str("Username", username);
+        j.str("Password", password);
+        String list #= CognitoAttributes.list(attributes);
+        j.raw("UserAttributes", list);
+        if (this.client.hasSecret()) {
+            String h #= this.client.secretHash(username);
+            j.str("SecretHash", h);
+        }
+        String body #= j.done();
+        JsonValue r #= this.client.call("SignUp", username, body);
+        String sub #= CognitoClient.text(r, "UserSub");
+        boolean confirmed = false;
+        JsonValue c = r.object().get("UserConfirmed");
+        if (c != null && c.kind() == JsonValue.BOOLEAN) confirmed = c.asBoolean();
+        return heap RegistrationResult(sub, confirmed);
+    }
+
+    public #RegistrationResult registerPasswordless(String username, Attributes attributes) {
+        throw heap IdentityException(IdentityException.UNSUPPORTED_CAPABILITY(), "cognito",
+            "registerPasswordless", username, "passwordless registration is not declared by this adapter");
+    }
+
+    public void confirm(String username, String code) {
+        CognitoJson j = heap CognitoJson();
+        String cid #= this.client.appClientId();
+        j.str("ClientId", cid);
+        j.str("Username", username);
+        j.str("ConfirmationCode", code);
+        if (this.client.hasSecret()) {
+            String h #= this.client.secretHash(username);
+            j.str("SecretHash", h);
+        }
+        String body #= j.done();
+        JsonValue r #= this.client.call("ConfirmSignUp", username, body);
+    }
+
+    public #User lookupBySubject(String subject) {
+        JsonValue r #= this.findBySubject(subject, "lookupBySubject");
+        if (r == null) CognitoUserPool.notFound("lookupBySubject", subject);
+        JsonValue found = CognitoUserPool.first(r);
+        String name #= CognitoClient.text(found, "Username");
+        String status #= CognitoClient.text(found, "UserStatus");
+        JsonValue list = found.object().get("Attributes");
+        return this.userOf(name, status, list);
+    }
+
+    public #User lookupByName(String username) {
+        String body #= this.userBody(username);
+        JsonValue r #= this.client.admin("AdminGetUser", username, body);
+        String name #= CognitoClient.text(r, "Username");
+        String status #= CognitoClient.text(r, "UserStatus");
+        JsonValue list = r.object().get("UserAttributes");
+        return this.userOf(name, status, list);
+    }
+
+    public boolean delete(String subject) {
+        JsonValue r0 #= this.findBySubject(subject, "delete");
+        if (r0 == null) return false;
+        JsonValue found = CognitoUserPool.first(r0);
+        String name #= CognitoClient.text(found, "Username");
+        String body #= this.userBody(name);
+        JsonValue r #= this.client.admin("AdminDeleteUser", subject, body);
+        return true;
+    }
+
+    public void setAttribute(String subject, String name, String value) {
+        String user #= this.usernameOf(subject, "setAttribute");
+        CognitoJson j = heap CognitoJson();
+        j.str("UserPoolId", this.poolId);
+        j.str("Username", user);
+        String list #= CognitoAttributes.single(name, value);
+        j.raw("UserAttributes", list);
+        String body #= j.done();
+        JsonValue r #= this.client.admin("AdminUpdateUserAttributes", subject, body);
+    }
+
+    public void removeAttribute(String subject, String name) {
+        String user #= this.usernameOf(subject, "removeAttribute");
+        String wire #= CognitoAttributes.wireName(name);
+        String quoted #= Jwt.quote(wire);
+        CognitoJson j = heap CognitoJson();
+        j.str("UserPoolId", this.poolId);
+        j.str("Username", user);
+        j.raw("UserAttributeNames", "[" + quoted + "]");
+        String body #= j.done();
+        JsonValue r #= this.client.admin("AdminDeleteUserAttributes", subject, body);
+    }
+
+    public void addToGroup(String subject, String group) {
+        this.groupCall("AdminAddUserToGroup", subject, group);
+    }
+
+    public void removeFromGroup(String subject, String group) {
+        this.groupCall("AdminRemoveUserFromGroup", subject, group);
+    }
+
+    public #String[] groups(String subject) {
+        String user #= this.usernameOf(subject, "groups");
+        ArrayList<String> names #= this.groupsOf(user, subject);
+        int32 n = names.count();
+        String[] out = heap String[n];
+        for (int32 i = 0; i < n; i++) {
+            String g = "" + names.get(i);
+            out[i] #= g;
+        }
+        return #out;
+    }
+
+    private void groupCall(String operation, String subject, String group) {
+        String user #= this.usernameOf(subject, operation);
+        CognitoJson j = heap CognitoJson();
+        j.str("UserPoolId", this.poolId);
+        j.str("Username", user);
+        j.str("GroupName", group);
+        String body #= j.done();
+        JsonValue r #= this.client.admin(operation, subject, body);
+    }
+
+    private #User userOf(String name, String status, JsonValue list) {
+        String sub #= CognitoAttributes.subOf(list);
+        Attributes attrs #= CognitoAttributes.fromList(list);
+        ArrayList<String> groups #= this.groupsOf(name, sub);
+        boolean confirmed = !status.equals("UNCONFIRMED");
+        return heap User(sub, name, confirmed, #attrs, #groups);
+    }
+
+    private #ArrayList<String> groupsOf(String username, String subject) {
+        ArrayList<String> out = heap ArrayList<String>();
+        String next = "";
+        boolean more = true;
+        while (more) {
+            CognitoJson j = heap CognitoJson();
+            j.str("UserPoolId", this.poolId);
+            j.str("Username", username);
+            j.num("Limit", 60L);
+            if (next.byteLength() > 0) j.str("NextToken", next);
+            String body #= j.done();
+            JsonValue r #= this.client.admin("AdminListGroupsForUser", subject, body);
+            JsonValue list = r.object().get("Groups");
+            if (list != null && list.kind() == JsonValue.ARRAY) {
+                JsonArray arr = list.array();
+                for (int32 i = 0; i < arr.count(); i++) {
+                    String g #= CognitoClient.text(arr.get(i), "GroupName");
+                    out.add(#g);
+                }
+            }
+            next #= CognitoClient.text(r, "NextToken");
+            more = next.byteLength() > 0;
+        }
+        return #out;
+    }
+
+    private #String userBody(String username) {
+        CognitoJson j = heap CognitoJson();
+        j.str("UserPoolId", this.poolId);
+        j.str("Username", username);
+        return j.done();
+    }
+
+    private #String usernameOf(String subject, String operation) {
+        JsonValue r #= this.findBySubject(subject, operation);
+        if (r == null) CognitoUserPool.notFound(operation, subject);
+        return CognitoClient.text(CognitoUserPool.first(r), "Username");
+    }
+
+    // The first entry of a ListUsers response; a view into it.
+    private static JsonValue first(JsonValue listUsers) {
+        return listUsers.object().get("Users").array().get(0);
+    }
+
+    // The ListUsers response holding the user whose sub is `subject`, or null.
+    private #JsonValue findBySubject(String subject, String operation) {
+        if (subject.indexOf("\"") >= 0L || subject.indexOf("\\") >= 0L) return null;
+        CognitoJson j = heap CognitoJson();
+        j.str("UserPoolId", this.poolId);
+        j.str("Filter", "sub = \"" + subject + "\"");
+        j.num("Limit", 1L);
+        String body #= j.done();
+        JsonValue r #= this.client.admin("ListUsers", subject, body);
+        JsonValue list = r.object().get("Users");
+        if (list == null || list.kind() != JsonValue.ARRAY || list.array().count() == 0) return null;
+        return #r;
+    }
+
+    private static void notFound(String operation, String subject) {
+        throw heap IdentityException(IdentityException.USER_NOT_FOUND(), "cognito",
+            operation, subject, "no user has this subject");
+    }
+}

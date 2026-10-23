@@ -1,0 +1,134 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.codec.Base64;
+import cajeta.codec.Base64Exception;
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.Jwt;
+
+/**
+ * Attribute names at the Cognito boundary (identity spec §14.2): the port's
+ * names are bare, Cognito's standard attributes are bare on the wire too,
+ * and every other attribute travels as `custom:<name>`.
+ */
+final class CognitoAttributes {
+    private static final String STANDARD =
+        " address birthdate email email_verified family_name gender given_name locale"
+        + " middle_name name nickname phone_number phone_number_verified picture"
+        + " preferred_username profile updated_at website zoneinfo sub ";
+
+    static #String wireName(String name) {
+        if (CognitoAttributes.STANDARD.indexOf(" " + name + " ") >= 0L
+                || name.startsWith("custom:")) {
+            return "" + name;
+        }
+        return "custom:" + name;
+    }
+
+    static #String portName(String wire) {
+        if (wire.startsWith("custom:")) {
+            String bare #= wire.substring(7, wire.byteLength());
+            return #bare;
+        }
+        return "" + wire;
+    }
+
+    /** `[{"Name":...,"Value":...},...]` under Cognito's names. */
+    static #String list(Attributes attrs) {
+        StringBuilder b = heap StringBuilder();
+        b.append("[");
+        for (int32 i = 0; i < attrs.count(); i++) {
+            if (i > 0) b.append(",");
+            String n #= attrs.nameAt(i);
+            String v #= attrs.valueAt(i);
+            String wn #= CognitoAttributes.wireName(n);
+            String qn #= Jwt.quote(wn);
+            String qv #= Jwt.quote(v);
+            b.append("{\"Name\":");
+            b.append(qn);
+            b.append(",\"Value\":");
+            b.append(qv);
+            b.append("}");
+        }
+        b.append("]");
+        return b.toString();
+    }
+
+    /** One attribute as the list form. */
+    static #String single(String name, String value) {
+        Attributes a = heap Attributes();
+        a.set(name, value);
+        return CognitoAttributes.list(a);
+    }
+
+    /** A `[{"Name","Value"}]` array as port attributes, `sub` left out. */
+    static #Attributes fromList(JsonValue list) {
+        Attributes out = heap Attributes();
+        if (list != null && list.kind() == JsonValue.ARRAY) {
+            JsonArray arr = list.array();
+            for (int32 i = 0; i < arr.count(); i++) {
+                JsonValue item = arr.get(i);
+                String n #= CognitoClient.text(item, "Name");
+                if (n.byteLength() == 0 || n.equals("sub")) continue;
+                String v #= CognitoClient.text(item, "Value");
+                String pn #= CognitoAttributes.portName(n);
+                out.set(pn, v);
+            }
+        }
+        return #out;
+    }
+
+    /** The `sub` in a `[{"Name","Value"}]` array, or "". */
+    static #String subOf(JsonValue list) {
+        if (list != null && list.kind() == JsonValue.ARRAY) {
+            JsonArray arr = list.array();
+            for (int32 i = 0; i < arr.count(); i++) {
+                JsonValue item = arr.get(i);
+                String n #= CognitoClient.text(item, "Name");
+                if (n.equals("sub")) return CognitoClient.text(item, "Value");
+            }
+        }
+        String none = "";
+        return #none;
+    }
+
+    /** `cognito:groups` from a token's payload, unverified; empty when it does not decode. */
+    static #ArrayList<String> tokenGroups(String token) {
+        ArrayList<String> groups = heap ArrayList<String>();
+        CognitoAttributes.addTokenGroups(groups, token);
+        return #groups;
+    }
+
+    private static void addTokenGroups(ArrayList<String> groups, String token) {
+        int64 a = token.indexOf(".");
+        if (a < 0L) return;
+        int64 b = token.indexOfFrom(".", a + 1L);
+        if (b < 0L) return;
+        String seg #= token.substring((int32) (a + 1L), (int32) b);
+        try {
+            int8[] payload #= Base64.decode(seg);
+            JsonValue root #= Json.parse(payload, payload.count());
+            if (root.kind() != JsonValue.OBJECT) return;
+            JsonValue list = root.object().get("cognito:groups");
+            if (list != null && list.kind() == JsonValue.ARRAY) {
+                JsonArray arr = list.array();
+                for (int32 i = 0; i < arr.count(); i++) {
+                    JsonValue gv = arr.get(i);
+                    if (gv.kind() != JsonValue.STRING) continue;
+                    String g #= JsonText.unescape(gv.asBytes(), gv.asBytesLength());
+                    groups.add(#g);
+                }
+            }
+        } catch (Base64Exception e) {
+            return;
+        } catch (JsonParseException e) {
+            return;
+        }
+    }
+}

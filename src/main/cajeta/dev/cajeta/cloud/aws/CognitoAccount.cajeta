@@ -1,0 +1,99 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.Account;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.TotpEnrollment;
+import dev.cajeta.cloud.identity.User;
+
+/**
+ * The signed-in user's own account (identity spec §14.1's user plane): every
+ * call carries the user's access token and is unsigned. `me` reads groups from
+ * the access token, as issued. Activating TOTP verifies the first code, then
+ * makes TOTP the preferred factor.
+ */
+public final class CognitoAccount implements Account {
+    CognitoClient client;
+    String poolName;
+
+    public CognitoAccount(CognitoClient client, String userPoolId) {
+        this.client #= client;
+        int64 us = userPoolId.indexOf("_");
+        String bare #= userPoolId.substring((int32) (us + 1L), userPoolId.byteLength());
+        this.poolName #= bare;
+        return;
+    }
+
+    public #User me(String accessToken) {
+        JsonValue r #= this.call("GetUser", accessToken, null);
+        String name #= CognitoClient.text(r, "Username");
+        JsonValue list = r.object().get("UserAttributes");
+        String sub #= CognitoAttributes.subOf(list);
+        Attributes attrs #= CognitoAttributes.fromList(list);
+        ArrayList<String> groups #= CognitoAttributes.tokenGroups(accessToken);
+        return heap User(sub, name, true, #attrs, #groups);
+    }
+
+    public void updateAttributes(String accessToken, Attributes attributes) {
+        CognitoJson j = heap CognitoJson();
+        j.str("AccessToken", accessToken);
+        String list #= CognitoAttributes.list(attributes);
+        j.raw("UserAttributes", list);
+        String body #= j.done();
+        JsonValue r #= this.client.call("UpdateUserAttributes", "-", body);
+    }
+
+    public void changePassword(String accessToken, String oldPassword, String newPassword) {
+        CognitoJson j = heap CognitoJson();
+        j.str("PreviousPassword", oldPassword);
+        j.str("ProposedPassword", newPassword);
+        j.str("AccessToken", accessToken);
+        String body #= j.done();
+        JsonValue r #= this.client.call("ChangePassword", "-", body);
+    }
+
+    public void deleteMe(String accessToken) {
+        JsonValue r #= this.call("DeleteUser", accessToken, null);
+    }
+
+    public #TotpEnrollment enrollTotp(String accessToken) {
+        JsonValue r #= this.call("AssociateSoftwareToken", accessToken, null);
+        String secret #= CognitoClient.text(r, "SecretCode");
+        String uri #= "otpauth://totp/" + this.poolName + "?secret=" + secret
+            + "&issuer=" + this.poolName;
+        return heap TotpEnrollment(secret, uri, "");
+    }
+
+    public void activateTotp(String accessToken, String code) {
+        JsonValue r #= this.call("VerifySoftwareToken", accessToken, code);
+        String status #= CognitoClient.text(r, "Status");
+        if (!status.equals("SUCCESS")) {
+            throw heap IdentityException(IdentityException.INVALID_CODE(), "cognito",
+                "activateTotp", "-", "the authenticator's first code did not verify");
+        }
+        CognitoJson j = heap CognitoJson();
+        j.str("AccessToken", accessToken);
+        j.open("SoftwareTokenMfaSettings");
+        j.bool("Enabled", true);
+        j.bool("PreferredMfa", true);
+        j.close();
+        String body #= j.done();
+        JsonValue p #= this.client.call("SetUserMFAPreference", "-", body);
+    }
+
+    public void signOutEverywhere(String accessToken) {
+        JsonValue r #= this.call("GlobalSignOut", accessToken, null);
+    }
+
+    // An access-token call, with UserCode when `code` is not null.
+    private #JsonValue call(String operation, String accessToken, String code) {
+        CognitoJson j = heap CognitoJson();
+        j.str("AccessToken", accessToken);
+        if (code != null) j.str("UserCode", code);
+        String body #= j.done();
+        return this.client.call(operation, "-", body);
+    }
+}

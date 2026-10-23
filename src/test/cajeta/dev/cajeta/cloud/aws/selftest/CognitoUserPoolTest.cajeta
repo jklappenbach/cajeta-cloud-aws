@@ -1,0 +1,207 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonValue;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.identity.RegistrationResult;
+import dev.cajeta.cloud.identity.TotpEnrollment;
+import dev.cajeta.cloud.identity.User;
+import dev.cajeta.cloud.aws.CognitoAccount;
+import dev.cajeta.cloud.aws.CognitoClient;
+import dev.cajeta.cloud.aws.CognitoUserPool;
+
+/**
+ * Registration, lookup, attributes and groups, and the signed-in user's own
+ * account (plan 3.1.1), against replies in the shapes the cognito-idp API
+ * reference documents. Port attribute names are bare; custom ones travel as
+ * `custom:<name>` (identity spec §14.2). Administrative calls are signed.
+ */
+public class CognitoUserPoolTest {
+    private static final String POOL_ID = "us-east-1_ExAmPlE12";
+    private static final String CLIENT = "3n4b5urk1ft4fl3mg5e62d9ado";
+    private static final String SUB = "4f3c2a10-9b7e-4d6a-8c21-0e5f7a9b3d14";
+    private static final String ADA_ATTRS =
+        "[{\"Name\":\"sub\",\"Value\":\"4f3c2a10-9b7e-4d6a-8c21-0e5f7a9b3d14\"},"
+        + "{\"Name\":\"email\",\"Value\":\"ada@example.com\"},"
+        + "{\"Name\":\"custom:team\",\"Value\":\"engines\"}]";
+
+    public CognitoUserPoolTest() {
+        return;
+    }
+
+    @Test
+    public void registerSendsAttributesUnderCognitosNames() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.reply(200, "{\"CodeDeliveryDetails\":{\"AttributeName\":\"email\",\"DeliveryMedium\":\"EMAIL\","
+            + "\"Destination\":\"a***@e***\"},\"UserConfirmed\":false,\"UserSub\":\"" + CognitoUserPoolTest.SUB + "\"}");
+        CognitoUserPool pool #= CognitoUserPoolTest.pool(t);
+        Attributes attrs = heap Attributes();
+        attrs.set("email", "ada@example.com");
+        attrs.set("team", "engines");
+        RegistrationResult r #= pool.registerWith("ada", "Correct-Horse-Battery-9", attrs);
+        String sub #= r.subject();
+        Assert.equals(CognitoUserPoolTest.SUB, sub);
+        Assert.isFalse(r.confirmed());
+        Assert.equals("SignUp", t.opAt(0));
+        Assert.isFalse(t.signedAt(0));
+        String body = t.bodyAt(0);
+        Assert.isTrue(body.indexOf("{\"Name\":\"email\",\"Value\":\"ada@example.com\"}") >= 0L);
+        Assert.isTrue(body.indexOf("{\"Name\":\"custom:team\",\"Value\":\"engines\"}") >= 0L);
+        Assert.isTrue(body.indexOf("\"Username\":\"ada\"") >= 0L);
+        return;
+    }
+
+    @Test
+    public void aTakenNameIsUserExistsAndConfirmSendsTheCode() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.error("UsernameExistsException", "User already exists");
+        t.reply(200, "{}");
+        CognitoUserPool pool #= CognitoUserPoolTest.pool(t);
+        int32 kind = -1;
+        try {
+            RegistrationResult r #= pool.register("ada", "Correct-Horse-Battery-9");
+        } catch (IdentityException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == IdentityException.USER_EXISTS());
+        pool.confirm("ada", "123456");
+        Assert.equals("ConfirmSignUp", t.opAt(1));
+        JsonValue sent #= Json.parse(t.bodyAt(1));
+        String code #= CognitoClient.text(sent, "ConfirmationCode");
+        Assert.equals("123456", code);
+        return;
+    }
+
+    @Test
+    public void lookupByNameReadsTheUserAndItsGroups() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.reply(200, "{\"Enabled\":true,\"UserAttributes\":" + CognitoUserPoolTest.ADA_ATTRS
+            + ",\"UserStatus\":\"CONFIRMED\",\"Username\":\"ada\"}");
+        t.reply(200, "{\"Groups\":[{\"GroupName\":\"admins\"},{\"GroupName\":\"editors\"}]}");
+        CognitoUserPool pool #= CognitoUserPoolTest.pool(t);
+        User u #= pool.lookupByName("ada");
+        String sub #= u.subject();
+        Assert.equals(CognitoUserPoolTest.SUB, sub);
+        String name #= u.username();
+        Assert.equals("ada", name);
+        Assert.isTrue(u.confirmed());
+        String team #= u.attributes().get("team");
+        Assert.equals("engines", team);
+        String email #= u.attributes().get("email");
+        Assert.equals("ada@example.com", email);
+        Assert.isTrue(u.inGroup("admins"));
+        Assert.isTrue(u.groupCount() == 2);
+        Assert.equals("AdminGetUser", t.opAt(0));
+        Assert.isTrue(t.signedAt(0));
+        Assert.equals("AdminListGroupsForUser", t.opAt(1));
+        Assert.isTrue(t.bodyAt(0).indexOf("\"UserPoolId\":\"us-east-1_ExAmPlE12\"") >= 0L);
+        return;
+    }
+
+    @Test
+    public void lookupBySubjectFiltersOnSub() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.reply(200, "{\"Users\":[{\"Attributes\":" + CognitoUserPoolTest.ADA_ATTRS
+            + ",\"Enabled\":true,\"UserStatus\":\"UNCONFIRMED\",\"Username\":\"ada\"}]}");
+        t.reply(200, "{\"Groups\":[]}");
+        t.reply(200, "{\"Users\":[]}");
+        CognitoUserPool pool #= CognitoUserPoolTest.pool(t);
+        User u #= pool.lookupBySubject(CognitoUserPoolTest.SUB);
+        Assert.isFalse(u.confirmed());
+        Assert.equals("ListUsers", t.opAt(0));
+        Assert.isTrue(t.bodyAt(0).indexOf("sub = \\\"" + CognitoUserPoolTest.SUB + "\\\"") >= 0L);
+        int32 kind = -1;
+        try {
+            User none #= pool.lookupBySubject("no-such-sub");
+        } catch (IdentityException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == IdentityException.USER_NOT_FOUND());
+        return;
+    }
+
+    @Test
+    public void attributesAndGroupsGoThroughTheAdminPlane() {
+        ScriptedTransport t = heap ScriptedTransport();
+        String found = "{\"Users\":[{\"Attributes\":" + CognitoUserPoolTest.ADA_ATTRS
+            + ",\"UserStatus\":\"CONFIRMED\",\"Username\":\"ada\"}]}";
+        t.reply(200, found);
+        t.reply(200, "{}");
+        t.reply(200, found);
+        t.reply(200, "{}");
+        t.reply(200, found);
+        t.reply(200, "{}");
+        t.reply(200, found);
+        t.reply(200, "{\"Groups\":[{\"GroupName\":\"admins\"}]}");
+        t.reply(200, found);
+        t.reply(200, "{}");
+        t.reply(200, "{\"Users\":[]}");
+        CognitoUserPool pool #= CognitoUserPoolTest.pool(t);
+        pool.setAttribute(CognitoUserPoolTest.SUB, "team", "wheels");
+        Assert.equals("AdminUpdateUserAttributes", t.opAt(1));
+        Assert.isTrue(t.bodyAt(1).indexOf("{\"Name\":\"custom:team\",\"Value\":\"wheels\"}") >= 0L);
+        Assert.isTrue(t.bodyAt(1).indexOf("\"Username\":\"ada\"") >= 0L);
+        pool.removeAttribute(CognitoUserPoolTest.SUB, "team");
+        Assert.equals("AdminDeleteUserAttributes", t.opAt(3));
+        Assert.isTrue(t.bodyAt(3).indexOf("\"custom:team\"") >= 0L);
+        pool.addToGroup(CognitoUserPoolTest.SUB, "admins");
+        Assert.equals("AdminAddUserToGroup", t.opAt(5));
+        String[] gs #= pool.groups(CognitoUserPoolTest.SUB);
+        Assert.isTrue(gs.count() == 1L);
+        Assert.equals("admins", gs[0]);
+        Assert.isTrue(pool.delete(CognitoUserPoolTest.SUB));
+        Assert.equals("AdminDeleteUser", t.opAt(9));
+        Assert.isFalse(pool.delete("no-such-sub"));
+        for (int32 i = 0; i < t.calls(); i++) Assert.isTrue(t.signedAt(i));
+        return;
+    }
+
+    @Test
+    public void theAccountActsWithTheAccessToken() {
+        ScriptedTransport t = heap ScriptedTransport();
+        t.reply(200, "{\"UserAttributes\":" + CognitoUserPoolTest.ADA_ATTRS + ",\"Username\":\"ada\"}");
+        t.reply(200, "{\"SecretCode\":\"JBSWY3DPEHPK3PXP\"}");
+        t.reply(200, "{\"Status\":\"SUCCESS\"}");
+        t.reply(200, "{}");
+        t.reply(200, "{\"Status\":\"ERROR\"}");
+        t.reply(200, "{}");
+        t.reply(200, "{}");
+        ManualTimeSource clock = heap ManualTimeSource(1767225660L);
+        CognitoClient client = heap CognitoClient("us-east-1", CognitoUserPoolTest.CLIENT, null, t);
+        CognitoAccount acct = heap CognitoAccount(client, CognitoUserPoolTest.POOL_ID);
+        User me #= acct.me("access-token-1");
+        String sub #= me.subject();
+        Assert.equals(CognitoUserPoolTest.SUB, sub);
+        Assert.equals("GetUser", t.opAt(0));
+        Assert.isFalse(t.signedAt(0));
+        TotpEnrollment e #= acct.enrollTotp("access-token-1");
+        String secret #= e.secret();
+        Assert.equals("JBSWY3DPEHPK3PXP", secret);
+        acct.activateTotp("access-token-1", "123456");
+        Assert.equals("VerifySoftwareToken", t.opAt(2));
+        Assert.equals("SetUserMFAPreference", t.opAt(3));
+        Assert.isTrue(t.bodyAt(3).indexOf("\"Enabled\":true") >= 0L);
+        int32 kind = -1;
+        try {
+            acct.activateTotp("access-token-1", "000000");
+        } catch (IdentityException x) {
+            kind = x.kind();
+        }
+        Assert.isTrue(kind == IdentityException.INVALID_CODE());
+        acct.changePassword("access-token-1", "Correct-Horse-Battery-9", "New-Horse-Battery-10");
+        Assert.equals("ChangePassword", t.opAt(5));
+        acct.signOutEverywhere("access-token-1");
+        Assert.equals("GlobalSignOut", t.opAt(6));
+        return;
+    }
+
+    private static #CognitoUserPool pool(ScriptedTransport t) {
+        CognitoClient client = heap CognitoClient("us-east-1", CognitoUserPoolTest.CLIENT, null, t);
+        ManualTimeSource clock = heap ManualTimeSource(1767225660L);
+        return CognitoUserPool.over(#client, CognitoUserPoolTest.POOL_ID, #clock);
+    }
+}
