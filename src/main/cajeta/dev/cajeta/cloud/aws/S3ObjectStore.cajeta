@@ -13,6 +13,8 @@ import dev.cajeta.cloud.object.ObjectReader;
 import dev.cajeta.cloud.object.ObjectStore;
 import dev.cajeta.cloud.object.ObjectWriter;
 import dev.cajeta.cloud.object.StatResult;
+import dev.cajeta.cloud.identity.SystemTimeSource;
+import dev.cajeta.cloud.identity.TimeSource;
 import dev.cajeta.codec.xml.XmlEvent;
 import dev.cajeta.codec.xml.XmlParseException;
 import dev.cajeta.codec.xml.XmlReader;
@@ -64,6 +66,23 @@ public final class S3ObjectStore implements ObjectStore {
         c.declare(Caps.RANGE_READ(), "");
         this.caps #= c;
         return;
+    }
+
+    /**
+     * A store over `bucket` with the AWS chain's credentials and region
+     * (`config` may be null), at the default part size. `endpoint` is null
+     * for AWS itself, or an S3-compatible service's base URL; `pathStyle`
+     * puts the bucket in the path. A missing key or region throws
+     * AwsConfigurationException naming the chain's steps; nothing is called
+     * until the first operation.
+     */
+    public static #S3ObjectStore connect(String bucket, String endpoint, boolean pathStyle,
+                                         AwsConfig config) {
+        AwsCredentials creds #= CredentialChain.resolve(config);
+        String region #= CredentialChain.region(config);
+        TimeSource clock = heap SystemTimeSource();
+        S3Transport t = heap HttpS3Transport(region, bucket, endpoint, pathStyle, #creds, #clock);
+        return heap S3ObjectStore(#t, bucket, S3ObjectStore.DEFAULT_PART_SIZE());
     }
 
     public Capabilities capabilities() { return this.caps; }
