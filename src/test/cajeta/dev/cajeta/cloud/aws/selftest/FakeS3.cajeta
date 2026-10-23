@@ -1,0 +1,467 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.collection.ArrayList;
+import cajeta.concurrent.Lock;
+import cajeta.concurrent.LockGuard;
+import cajeta.lang.String;
+import dev.cajeta.codec.xml.XmlEvent;
+import dev.cajeta.codec.xml.XmlParseException;
+import dev.cajeta.codec.xml.XmlReader;
+import dev.cajeta.codec.xml.XmlWriter;
+import dev.cajeta.cloud.aws.S3Reply;
+import dev.cajeta.cloud.aws.S3Request;
+import dev.cajeta.cloud.aws.S3Transport;
+
+/**
+ * An in-memory bucket answering S3's REST API in the shapes the S3 API
+ * reference documents: PutObject with If-None-Match: * and If-Match (412 on a
+ * failed condition, 404 NoSuchKey for If-Match on an absent key), GetObject
+ * with Range (206, 416 InvalidRange), HeadObject (no body), DeleteObject (204
+ * either way), CopyObject, ListObjectsV2 with prefix, delimiter, max-keys and
+ * continuation, and multipart. One lock serializes it, as S3 serializes
+ * conditional writes per key. It logs every request and records the largest
+ * part body it was sent; `conflicts` answers that many conditional puts with
+ * 409 ConditionalRequestConflict first.
+ */
+public final class FakeS3 implements S3Transport {
+    Lock lock;
+    ArrayList<String> keys;          // sorted, bytewise
+    ArrayList<FakeS3Object> objects; // parallel to keys
+    ArrayList<String> uploadIds;
+    ArrayList<FakeS3Upload> uploads;
+    int64 seq;
+    public ArrayList<String> log;
+    public int64 largestPart;
+    public int32 conflicts;
+
+    public FakeS3() {
+        this.lock = heap Lock();
+        this.keys = heap ArrayList<String>();
+        this.objects = heap ArrayList<FakeS3Object>();
+        this.uploadIds = heap ArrayList<String>();
+        this.uploads = heap ArrayList<FakeS3Upload>();
+        this.seq = 0L;
+        this.log = heap ArrayList<String>();
+        this.largestPart = 0L;
+        this.conflicts = 0;
+        return;
+    }
+
+    public int32 calls() { return this.log.count(); }
+    public String callAt(int32 i) { return this.log.get(i); }
+
+    /** True when some logged call contains `text`. */
+    public boolean sent(String text) {
+        for (int32 i = 0; i < this.log.count(); i++) {
+            if (this.log.get(i).indexOf(text) >= 0L) return true;
+        }
+        return false;
+    }
+
+    public int32 openUploads() { return this.uploadIds.count(); }
+
+    public #S3Reply send(S3Request r) {
+        LockGuard g #= this.lock.acquire();
+        String line #= FakeS3.describe(r);
+        this.log.add(#line);
+        String m = r.method();
+        String key = r.key();
+        String uploadId #= r.queryOr("uploadId");
+        if (key.byteLength() == 0) {
+            if (m.equals("GET")) return this.list(r);
+            return FakeS3.error(400, "InvalidRequest", "bucket-level " + m);
+        }
+        if (m.equals("POST") && r.queryOr("uploads") != null) return this.createUpload(r);
+        if (uploadId != null) {
+            if (m.equals("PUT")) return this.uploadPart(r, uploadId);
+            if (m.equals("POST")) return this.completeUpload(r, uploadId);
+            if (m.equals("DELETE")) return this.abortUpload(uploadId);
+        }
+        if (m.equals("PUT")) {
+            String src #= r.headerOr("x-amz-copy-source");
+            if (src.byteLength() > 0) return this.copy(src, key);
+            return this.put(r);
+        }
+        if (m.equals("GET")) return this.get(r);
+        if (m.equals("HEAD")) return this.head(key);
+        if (m.equals("DELETE")) {
+            int32 at = this.find(key);
+            if (at >= 0) {
+                String gone #= this.keys.removeAt(at);
+                FakeS3Object o #= this.objects.removeAt(at);
+            }
+            return S3Reply.of(204, "");
+        }
+        return FakeS3.error(405, "MethodNotAllowed", m);
+    }
+
+    private #S3Reply put(S3Request r) {
+        String key = r.key();
+        int32 at = this.find(key);
+        String inm #= r.headerOr("If-None-Match");
+        String im #= r.headerOr("If-Match");
+        if ((inm.byteLength() > 0 || im.byteLength() > 0) && this.conflicts > 0) {
+            this.conflicts = this.conflicts - 1;
+            return FakeS3.error(409, "ConditionalRequestConflict", "A conflicting conditional operation is in progress");
+        }
+        if (inm.equals("*") && at >= 0) {
+            return FakeS3.error(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+        }
+        if (im.byteLength() > 0) {
+            if (at < 0) return FakeS3.error(404, "NoSuchKey", "The specified key does not exist.");
+            if (!this.objects.get(at).etag.equals(im)) {
+                return FakeS3.error(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+            }
+        }
+        int64 n = r.bodyLength();
+        if (n < 0L) n = 0L;
+        int8[] copy = heap int8[n < 1L ? 1L : n];
+        int8[] src = r.bodyBytes();
+        for (int64 i = 0L; i < n; i++) copy[i] = src[i];
+        String ct #= r.headerOr("Content-Type");
+        String etag #= this.install(key, #copy, n, ct);
+        S3Reply ok #= S3Reply.of(200, "");
+        ok.header("ETag", etag);
+        return #ok;
+    }
+
+    private #String install(String key, #int8[] data, int64 n, String contentType) {
+        this.seq = this.seq + 1L;
+        String etag #= "\"e" + this.seq + "\"";
+        FakeS3Object o = heap FakeS3Object(#data, n, contentType, etag, this.seq);
+        int32 at = this.find(key);
+        if (at >= 0) {
+            this.objects.set(at, #o);
+            return #etag;
+        }
+        int32 pos = 0;
+        while (pos < this.keys.count() && FakeS3.less(this.keys.get(pos), key)) pos = pos + 1;
+        String k = "" + key;
+        this.keys.insert(pos, #k);
+        this.objects.insert(pos, #o);
+        return #etag;
+    }
+
+    private #S3Reply get(S3Request r) {
+        int32 at = this.find(r.key());
+        if (at < 0) return FakeS3.error(404, "NoSuchKey", "The specified key does not exist.");
+        FakeS3Object o = this.objects.get(at);
+        String range #= r.headerOr("Range");
+        int64 from = 0L;
+        int64 to = o.len - 1L;
+        int32 status = 200;
+        if (range.byteLength() > 0) {
+            int64 dash = range.indexOf("-");
+            String a #= range.substring(6, (int32) dash);
+            String b #= range.substring((int32) (dash + 1L), range.byteLength());
+            from = FakeS3.parse(a);
+            to = FakeS3.parse(b);
+            if (from >= o.len) {
+                return FakeS3.error(416, "InvalidRange", "The requested range is not satisfiable");
+            }
+            if (to >= o.len) to = o.len - 1L;
+            status = 206;
+        }
+        int64 n = to - from + 1L;
+        int8[] out = heap int8[n < 1L ? 1L : n];
+        for (int64 i = 0L; i < n; i++) out[i] = o.data[from + i];
+        S3Reply rep = heap S3Reply(status, #out, n);
+        rep.header("ETag", o.etag);
+        rep.header("Content-Type", o.contentType);
+        if (status == 206) rep.header("Content-Range", "bytes " + from + "-" + to + "/" + o.len);
+        return #rep;
+    }
+
+    private #S3Reply head(String key) {
+        int32 at = this.find(key);
+        if (at < 0) return S3Reply.of(404, "");
+        FakeS3Object o = this.objects.get(at);
+        S3Reply rep #= S3Reply.of(200, "");
+        rep.header("Content-Length", "" + o.len);
+        rep.header("Content-Type", o.contentType);
+        rep.header("ETag", o.etag);
+        rep.header("Last-Modified", "Thu, 01 Jan 2026 00:00:00 GMT");
+        return #rep;
+    }
+
+    private #S3Reply copy(String source, String dst) {
+        // "/<bucket>/<percent-encoded key>"
+        int64 slash = source.indexOfFrom("/", 1L);
+        String enc #= source.substring((int32) (slash + 1L), source.byteLength());
+        String src #= FakeS3.decode(enc);
+        int32 at = this.find(src);
+        if (at < 0) return FakeS3.error(404, "NoSuchKey", "The specified key does not exist.");
+        FakeS3Object o = this.objects.get(at);
+        int8[] copy = heap int8[o.len < 1L ? 1L : o.len];
+        for (int64 i = 0L; i < o.len; i++) copy[i] = o.data[i];
+        String etag #= this.install(dst, #copy, o.len, o.contentType);
+        XmlWriter w = heap XmlWriter();
+        w.start("CopyObjectResult");
+        w.element("LastModified", "2026-01-01T00:00:00.000Z");
+        w.element("ETag", etag);
+        w.end();
+        String doc #= w.toString();
+        return S3Reply.of(200, doc);
+    }
+
+    private #S3Reply list(S3Request r) {
+        String prefix #= FakeS3.orEmpty(r.queryOr("prefix"));
+        String delim #= FakeS3.orEmpty(r.queryOr("delimiter"));
+        String token #= FakeS3.orEmpty(r.queryOr("continuation-token"));
+        String mk #= FakeS3.orEmpty(r.queryOr("max-keys"));
+        int64 max = 1000L;
+        if (mk.byteLength() > 0) max = FakeS3.parse(mk);
+        XmlWriter w = heap XmlWriter();
+        w.start("ListBucketResult");
+        w.element("Name", "examplebucket");
+        w.element("Prefix", prefix);
+        int64 count = 0L;
+        String last = "";
+        boolean truncated = false;
+        ArrayList<String> seenPrefixes = heap ArrayList<String>();
+        for (int32 i = 0; i < this.keys.count() && !truncated; i++) {
+            String k = this.keys.get(i);
+            if (!k.startsWith(prefix)) continue;
+            if (token.byteLength() > 0 && !FakeS3.less(token, k)) continue;
+            String group = null;
+            if (delim.byteLength() > 0) {
+                int64 d = k.indexOfFrom(delim, (int64) prefix.byteLength());
+                if (d >= 0L) group #= k.substring(0, (int32) d + delim.byteLength());
+            }
+            if (group != null) {
+                boolean dup = false;
+                for (int32 j = 0; j < seenPrefixes.count(); j++) {
+                    if (seenPrefixes.get(j).equals(group)) dup = true;
+                }
+                if (dup) continue;
+                if (token.byteLength() > 0 && !FakeS3.less(token, group)) continue;
+            }
+            if (count >= max) {
+                truncated = true;
+                continue;
+            }
+            if (group != null) {
+                String g = "" + group;
+                seenPrefixes.add(#g);
+                last #= "" + group;
+            } else {
+                FakeS3Object o = this.objects.get(i);
+                w.start("Contents");
+                w.element("Key", k);
+                w.element("LastModified", "2026-01-01T00:00:00.000Z");
+                w.element("ETag", o.etag);
+                w.element("Size", "" + o.len);
+                w.end();
+                last #= "" + k;
+            }
+            count = count + 1L;
+        }
+        for (int32 j = 0; j < seenPrefixes.count(); j++) {
+            w.start("CommonPrefixes");
+            w.element("Prefix", seenPrefixes.get(j));
+            w.end();
+        }
+        w.element("KeyCount", "" + count);
+        w.element("MaxKeys", "" + max);
+        if (truncated) {
+            w.element("IsTruncated", "true");
+            w.element("NextContinuationToken", last);
+        } else {
+            w.element("IsTruncated", "false");
+        }
+        w.end();
+        String doc #= w.toString();
+        return S3Reply.of(200, doc);
+    }
+
+    private #S3Reply createUpload(S3Request r) {
+        this.seq = this.seq + 1L;
+        String id #= "up" + this.seq;
+        String ct #= r.headerOr("Content-Type");
+        FakeS3Upload u = heap FakeS3Upload(r.key(), ct);
+        String idc = "" + id;
+        this.uploadIds.add(#idc);
+        this.uploads.add(#u);
+        XmlWriter w = heap XmlWriter();
+        w.start("InitiateMultipartUploadResult");
+        w.element("Bucket", "examplebucket");
+        w.element("Key", r.key());
+        w.element("UploadId", id);
+        w.end();
+        String doc #= w.toString();
+        return S3Reply.of(200, doc);
+    }
+
+    private #S3Reply uploadPart(S3Request r, String uploadId) {
+        int32 at = this.findUpload(uploadId);
+        if (at < 0) return FakeS3.error(404, "NoSuchUpload", "The specified upload does not exist.");
+        String pn #= FakeS3.orEmpty(r.queryOr("partNumber"));
+        int32 number = (int32) FakeS3.parse(pn);
+        int64 n = r.bodyLength();
+        if (n > this.largestPart) this.largestPart = n;
+        int8[] copy = heap int8[n < 1L ? 1L : n];
+        int8[] src = r.bodyBytes();
+        for (int64 i = 0L; i < n; i++) copy[i] = src[i];
+        this.seq = this.seq + 1L;
+        String etag #= "\"p" + this.seq + "\"";
+        this.uploads.get(at).put(number, #copy, n, etag);
+        S3Reply ok #= S3Reply.of(200, "");
+        ok.header("ETag", etag);
+        return #ok;
+    }
+
+    private #S3Reply completeUpload(S3Request r, String uploadId) {
+        int32 at = this.findUpload(uploadId);
+        if (at < 0) return FakeS3.error(404, "NoSuchUpload", "The specified upload does not exist.");
+        FakeS3Upload u = this.uploads.get(at);
+        ArrayList<int32> nums = heap ArrayList<int32>();
+        ArrayList<String> tags = heap ArrayList<String>();
+        try {
+            XmlReader x = heap XmlReader(r.bodyBytes(), r.bodyLength());
+            int32 ev = x.next();
+            int32 num = -1;
+            while (ev != XmlEvent.END_DOCUMENT) {
+                if (ev == XmlEvent.START_ELEMENT && x.name().equals("PartNumber")) {
+                    String t #= x.readText();
+                    num = (int32) FakeS3.parse(t);
+                } else if (ev == XmlEvent.START_ELEMENT && x.name().equals("ETag")) {
+                    String t #= x.readText();
+                    tags.add(#t);
+                } else if (ev == XmlEvent.END_ELEMENT && x.name().equals("Part")) {
+                    nums.add(num);
+                }
+                ev = x.next();
+            }
+        } catch (XmlParseException e) {
+            return FakeS3.error(400, "MalformedXML", "The XML you provided was not well-formed");
+        }
+        if (nums.count() == 0) return FakeS3.error(400, "MalformedXML", "no parts");
+        int64 total = 0L;
+        for (int32 i = 0; i < nums.count(); i++) {
+            if (i > 0 && nums.get(i) <= nums.get(i - 1)) {
+                return FakeS3.error(400, "InvalidPartOrder", "The list of parts was not in ascending order.");
+            }
+            int32 p = u.indexOf(nums.get(i));
+            if (p < 0 || !u.tags.get(p).equals(tags.get(i))) {
+                return FakeS3.error(400, "InvalidPart", "One or more of the specified parts could not be found.");
+            }
+            total = total + u.lens.get(p);
+        }
+        int8[] all = heap int8[total < 1L ? 1L : total];
+        int64 o = 0L;
+        for (int32 i = 0; i < nums.count(); i++) {
+            int32 p = u.indexOf(nums.get(i));
+            int8[] d = u.datas.get(p);
+            int64 n = u.lens.get(p);
+            for (int64 j = 0L; j < n; j++) all[o + j] = d[j];
+            o = o + n;
+        }
+        String key = "" + u.key;
+        String ct = "" + u.contentType;
+        String etag #= this.install(key, #all, total, ct);
+        String gone #= this.uploadIds.removeAt(at);
+        FakeS3Upload done #= this.uploads.removeAt(at);
+        XmlWriter w = heap XmlWriter();
+        w.start("CompleteMultipartUploadResult");
+        w.element("Key", key);
+        w.element("ETag", etag);
+        w.end();
+        String doc #= w.toString();
+        return S3Reply.of(200, doc);
+    }
+
+    private #S3Reply abortUpload(String uploadId) {
+        int32 at = this.findUpload(uploadId);
+        if (at < 0) return FakeS3.error(404, "NoSuchUpload", "The specified upload does not exist.");
+        String gone #= this.uploadIds.removeAt(at);
+        FakeS3Upload done #= this.uploads.removeAt(at);
+        return S3Reply.of(204, "");
+    }
+
+    private int32 find(String key) {
+        for (int32 i = 0; i < this.keys.count(); i++) {
+            if (this.keys.get(i).equals(key)) return i;
+        }
+        return -1;
+    }
+
+    private int32 findUpload(String id) {
+        for (int32 i = 0; i < this.uploadIds.count(); i++) {
+            if (this.uploadIds.get(i).equals(id)) return i;
+        }
+        return -1;
+    }
+
+    static #S3Reply error(int32 status, String code, String message) {
+        XmlWriter w = heap XmlWriter();
+        w.start("Error");
+        w.element("Code", code);
+        w.element("Message", message);
+        w.end();
+        String doc #= w.toString();
+        return S3Reply.of(status, doc);
+    }
+
+    static #String describe(S3Request r) {
+        String out #= r.method() + " /" + r.key();
+        for (int32 i = 0; i < r.queryCount(); i++) {
+            out #= out + (i == 0 ? "?" : "&") + r.queryName(i) + "=" + r.queryValue(i);
+        }
+        for (int32 i = 0; i < r.headerCount(); i++) {
+            out #= out + " [" + r.headerName(i) + ": " + r.headerValue(i) + "]";
+        }
+        return #out;
+    }
+
+    static boolean less(String a, String b) {
+        int32 n = a.byteLength();
+        int32 m = b.byteLength();
+        int32 k = n < m ? n : m;
+        for (int32 i = 0; i < k; i++) {
+            int32 x = ((int32) a.byteAt(i)) & 0xff;
+            int32 y = ((int32) b.byteAt(i)) & 0xff;
+            if (x != y) return x < y;
+        }
+        return n < m;
+    }
+
+    static int64 parse(String s) {
+        int64 v = 0L;
+        for (int32 i = 0; i < s.byteLength(); i++) {
+            int32 c = (int32) s.byteAt(i);
+            if (c < 48 || c > 57) return v;
+            v = v * 10L + (int64) (c - 48);
+        }
+        return v;
+    }
+
+    static #String orEmpty(String s) {
+        if (s == null) return "" + "";
+        return "" + s;
+    }
+
+    static #String decode(String s) {
+        int32 n = s.byteLength();
+        int8[] out = heap int8[n < 1 ? 1 : n];
+        int32 o = 0;
+        int32 i = 0;
+        while (i < n) {
+            int8 c = s.byteAt(i);
+            if (c == (int8) 37 && i + 2 < n) {
+                out[o] = (int8) ((FakeS3.hex(s.byteAt(i + 1)) << 4) | FakeS3.hex(s.byteAt(i + 2)));
+                i = i + 3;
+            } else {
+                out[o] = c;
+                i = i + 1;
+            }
+            o = o + 1;
+        }
+        return heap String(#out, o);
+    }
+
+    static int32 hex(int8 c) {
+        if (c >= (int8) 48 && c <= (int8) 57) return (int32) c - 48;
+        if (c >= (int8) 97 && c <= (int8) 102) return (int32) c - 87;
+        return (int32) c - 55;
+    }
+}

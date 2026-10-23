@@ -1,0 +1,55 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.object.ObjectReader;
+
+/** An incremental read pulling one part-sized range at a time. */
+final class S3Reader implements ObjectReader {
+    S3ObjectStore store;
+    String key;
+    int64 total;
+    int64 chunkSize;
+    int64 pos;
+    int8[] chunk;
+    int64 chunkLen;
+    int64 chunkPos;
+
+    S3Reader(S3ObjectStore store, String key, int64 size, int64 chunkSize) {
+        this.store #= store;
+        this.key = "" + key;
+        this.total = size;
+        this.chunkSize = chunkSize;
+        this.pos = 0L;
+        this.chunk = null;
+        this.chunkLen = 0L;
+        this.chunkPos = 0L;
+        return;
+    }
+
+    public int64 read(int8[] buf, int64 max) {
+        if (this.pos >= this.total || max < 1L) {
+            if (this.pos >= this.total) return -1L;
+            return 0L;
+        }
+        if (this.chunkPos >= this.chunkLen) {
+            this.chunk #= this.store.getRange(this.key, this.pos, this.chunkSize);
+            this.chunkLen = this.chunk.count();
+            this.chunkPos = 0L;
+        }
+        int64 n = this.chunkLen - this.chunkPos;
+        if (n > max) n = max;
+        for (int64 i = 0L; i < n; i++) buf[i] = this.chunk[this.chunkPos + i];
+        this.chunkPos = this.chunkPos + n;
+        this.pos = this.pos + n;
+        return n;
+    }
+
+    public int64 size() { return this.total; }
+
+    public void close() {
+        this.chunk = null;
+        this.chunkLen = 0L;
+        this.chunkPos = 0L;
+        this.pos = this.total;
+    }
+}

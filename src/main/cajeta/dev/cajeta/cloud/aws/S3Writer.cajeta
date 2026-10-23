@@ -1,0 +1,86 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.object.ObjectWriter;
+
+/**
+ * An incremental write holding at most one part: an object that fits in one
+ * part is a single PutObject at `complete`; a larger one becomes a multipart
+ * upload when the second part begins, each full part uploaded as it fills.
+ * Nothing is visible until `complete`; `abort` cancels the upload.
+ */
+final class S3Writer implements ObjectWriter {
+    S3ObjectStore store;
+    String key;
+    String contentType;
+    int8[] buf;
+    int64 fill;
+    String uploadId;
+    ArrayList<int32> numbers;
+    ArrayList<String> etags;
+    boolean done;
+
+    S3Writer(S3ObjectStore store, String key, String contentType, int64 partSize) {
+        this.store #= store;
+        this.key = "" + key;
+        this.contentType = "" + contentType;
+        this.buf = heap int8[partSize];
+        this.fill = 0L;
+        this.uploadId = null;
+        this.numbers = heap ArrayList<int32>();
+        this.etags = heap ArrayList<String>();
+        this.done = false;
+        return;
+    }
+
+    public void write(int8[] chunk, int64 len) {
+        if (this.done) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "write", this.key,
+                "writer already completed or aborted");
+        }
+        int64 cap = this.buf.count();
+        int64 off = 0L;
+        while (off < len) {
+            if (this.fill == cap) this.flushPart();
+            int64 take = cap - this.fill;
+            if (take > len - off) take = len - off;
+            for (int64 i = 0L; i < take; i++) this.buf[this.fill + i] = chunk[off + i];
+            this.fill = this.fill + take;
+            off = off + take;
+        }
+    }
+
+    // Upload the buffered part, starting the multipart upload on the first.
+    private void flushPart() {
+        if (this.uploadId == null) {
+            this.uploadId #= this.store.createUpload(this.key, this.contentType);
+        }
+        int32 number = this.numbers.count() + 1;
+        String etag #= this.store.uploadPart(this.key, this.uploadId, number, this.buf, this.fill);
+        this.numbers.add(number);
+        this.etags.add(#etag);
+        this.fill = 0L;
+    }
+
+    public #String complete() {
+        if (this.done) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "complete", this.key,
+                "writer already completed or aborted");
+        }
+        this.done = true;
+        if (this.uploadId == null) {
+            int8[] whole #= S3ObjectStore.exact(this.buf, 0L, this.fill);
+            return this.store.put(this.key, whole, this.contentType);
+        }
+        if (this.fill > 0L) this.flushPart();
+        return this.store.completeUpload(this.key, this.uploadId, this.numbers, this.etags);
+    }
+
+    public void abort() {
+        if (this.done) return;
+        this.done = true;
+        if (this.uploadId != null) this.store.abortUpload(this.key, this.uploadId);
+    }
+}

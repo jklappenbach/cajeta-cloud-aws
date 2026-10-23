@@ -1,0 +1,277 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.object.CondResult;
+import dev.cajeta.cloud.object.ListPage;
+import dev.cajeta.cloud.object.MultipartUpload;
+import dev.cajeta.cloud.object.ObjectReader;
+import dev.cajeta.cloud.object.ObjectWriter;
+import dev.cajeta.cloud.object.StatResult;
+import dev.cajeta.cloud.testkit.ObjectStoreContract;
+import dev.cajeta.cloud.aws.S3ObjectStore;
+
+/**
+ * The S3 object store (plan 4.1.1 to 4.1.3, adapters spec 2.4) against
+ * FakeS3, an in-memory bucket answering in S3's documented shapes: put, get,
+ * stat and ranges; conditional puts with If-None-Match and If-Match and the
+ * loser told the current etag; listing with delimiter and continuation;
+ * copy and delete; multipart; a streaming writer and reader that never hold
+ * more than one part; and cajeta-cloud's object-store conformance suite over
+ * the whole port.
+ */
+public class S3ObjectStoreTest {
+    private static final int64 SMALL_PART = 65536L;
+
+    public S3ObjectStoreTest() {
+        return;
+    }
+
+    @Test
+    public void putGetStatAndRange() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        int8[] hello #= S3ObjectStoreTest.bytes("hello s3");
+        String etag #= s.put("a/b.txt", hello, "text/plain");
+        Assert.equals("\"e1\"", etag);
+        int8[] back #= s.get("a/b.txt");
+        Assert.equals("hello s3", S3ObjectStoreTest.text(back));
+        StatResult st #= s.stat("a/b.txt");
+        Assert.isTrue(st.exists);
+        Assert.isTrue(st.size == 8L);
+        Assert.equals("text/plain", st.contentType);
+        Assert.equals("\"e1\"", st.etag);
+        Assert.isTrue(st.lastModified == 1767225600000L);
+        int8[] tail #= s.getRange("a/b.txt", 6L, 10L);
+        Assert.equals("s3", S3ObjectStoreTest.text(tail));
+        Assert.isTrue(fake.sent("[Range: bytes=6-15]"));
+        Assert.isTrue(S3ObjectStoreTest.kindOfRange(s, "a/b.txt", 8L, 1L) == CloudException.PROVIDER_ERROR());
+        Assert.isTrue(S3ObjectStoreTest.kindOfRange(s, "missing", 0L, 1L) == CloudException.NOT_FOUND());
+        StatResult none #= s.stat("missing");
+        Assert.isFalse(none.exists);
+        return;
+    }
+
+    @Test
+    public void conditionalPutsSendTheirHeadersAndTheLoserLearnsTheEtag() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        int8[] v1 #= S3ObjectStoreTest.bytes("one");
+        int8[] v2 #= S3ObjectStoreTest.bytes("two");
+        CondResult first #= s.putIfAbsent("k", v1, "text/plain");
+        Assert.isTrue(first.won);
+        Assert.isTrue(fake.sent("[If-None-Match: *]"));
+        CondResult second #= s.putIfAbsent("k", v2, "text/plain");
+        Assert.isFalse(second.won);
+        Assert.equals(first.etag, second.etag);
+        CondResult swap #= s.putIfMatch("k", v2, "text/plain", first.etag);
+        Assert.isTrue(swap.won);
+        Assert.isTrue(fake.sent("[If-Match: \"e1\"]"));
+        CondResult stale #= s.putIfMatch("k", v1, "text/plain", first.etag);
+        Assert.isFalse(stale.won);
+        Assert.equals(swap.etag, stale.etag);
+        CondResult absent #= s.putIfMatch("nothing-here", v1, "text/plain", first.etag);
+        Assert.isFalse(absent.won);
+        Assert.equals("", absent.etag);
+        int8[] now #= s.get("k");
+        Assert.equals("two", S3ObjectStoreTest.text(now));
+        return;
+    }
+
+    @Test
+    public void aConflictingConditionalWriteIsRetriedThenTransient() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        int8[] v #= S3ObjectStoreTest.bytes("v");
+        fake.conflicts = 2;
+        CondResult r #= s.putIfAbsent("c", v, "text/plain");
+        Assert.isTrue(r.won);
+        fake.conflicts = 10;
+        int32 kind = -1;
+        try {
+            CondResult x #= s.putIfAbsent("d", v, "text/plain");
+        } catch (CloudException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == CloudException.TRANSIENT());
+        return;
+    }
+
+    @Test
+    public void listingGroupsByDelimiterAndPages() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        int8[] x #= S3ObjectStoreTest.bytes("x");
+        String e1 #= s.put("a/1", x, "text/plain");
+        String e2 #= s.put("a/2", x, "text/plain");
+        String e3 #= s.put("a/b/3", x, "text/plain");
+        String e4 #= s.put("c", x, "text/plain");
+        ListPage grouped #= s.list("a/", "/", "", 10L);
+        Assert.isTrue(grouped.count() == 2L);
+        String k0 #= grouped.keyAt(0L);
+        Assert.equals("a/1", k0);
+        Assert.isTrue(grouped.sizeAt(0L) == 1L);
+        Assert.isTrue(grouped.prefixCount() == 1L);
+        String p0 #= grouped.prefixAt(0L);
+        Assert.equals("a/b/", p0);
+        Assert.isTrue(grouped.ordered);
+        Assert.isTrue(fake.sent("list-type=2"));
+        ListPage first #= s.list("", "", "", 2L);
+        Assert.isTrue(first.count() == 2L);
+        String token #= first.nextToken();
+        Assert.isTrue(token.byteLength() > 0);
+        ListPage second #= s.list("", "", token, 2L);
+        String s0 #= second.keyAt(0L);
+        Assert.equals("a/b/3", s0);
+        String s1 #= second.keyAt(1L);
+        Assert.equals("c", s1);
+        String done #= second.nextToken();
+        Assert.equals("", done);
+        return;
+    }
+
+    @Test
+    public void deleteReportsExistenceAndCopyIsServerSide() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        int8[] x #= S3ObjectStoreTest.bytes("payload");
+        String e #= s.put("src key+1", x, "application/octet-stream");
+        String c #= s.copy("src key+1", "dst");
+        int8[] got #= s.get("dst");
+        Assert.equals("payload", S3ObjectStoreTest.text(got));
+        Assert.isTrue(fake.sent("[x-amz-copy-source: /examplebucket/src%20key%2B1]"));
+        Assert.isTrue(s.delete("dst"));
+        Assert.isFalse(s.delete("dst"));
+        int32 kind = -1;
+        try {
+            String n #= s.copy("no-such", "dst2");
+        } catch (CloudException ex) {
+            kind = ex.kind();
+        }
+        Assert.isTrue(kind == CloudException.NOT_FOUND());
+        return;
+    }
+
+    @Test
+    public void multipartAssemblesInPartOrderAndAbortLeavesNothing() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        MultipartUpload up #= s.beginMultipart("big", "application/octet-stream");
+        int8[] b #= S3ObjectStoreTest.bytes("BBB");
+        int8[] a0 #= S3ObjectStoreTest.bytes("xxx");
+        int8[] a #= S3ObjectStoreTest.bytes("AAA");
+        up.addPart(2, b);
+        up.addPart(1, a0);
+        up.addPart(1, a);
+        String etag #= up.complete();
+        int8[] whole #= s.get("big");
+        Assert.equals("AAABBB", S3ObjectStoreTest.text(whole));
+        Assert.isTrue(fake.sent("POST /big?uploads="));
+        MultipartUpload gone #= s.beginMultipart("never", "text/plain");
+        gone.addPart(1, a);
+        gone.abort();
+        Assert.isTrue(fake.openUploads() == 0);
+        StatResult st #= s.stat("never");
+        Assert.isFalse(st.exists);
+        return;
+    }
+
+    @Test
+    public void theWriterStreamsPartsAndNeverHoldsMoreThanOne() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        ObjectWriter w #= s.openWrite("stream.bin", "application/octet-stream");
+        int8[] chunk = heap int8[10000];
+        for (int32 i = 0; i < 40; i++) {
+            for (int32 j = 0; j < 10000; j++) chunk[j] = (int8) ((i * 7 + j) & 0x7f);
+            w.write(chunk, 10000L);
+        }
+        String etag #= w.complete();
+        // 400,000 bytes in parts of 65,536: six full parts and a last of 6,784.
+        Assert.isTrue(fake.largestPart == S3ObjectStoreTest.SMALL_PART);
+        Assert.isTrue(S3ObjectStoreTest.count(fake, "partNumber=") == 7);
+        Assert.isTrue(S3ObjectStore.partsFor(5368709120L, S3ObjectStore.DEFAULT_PART_SIZE()) == 640L);
+        ObjectReader r #= s.openRead("stream.bin");
+        Assert.isTrue(r.size() == 400000L);
+        int8[] buf = heap int8[30000];
+        int64 total = 0L;
+        boolean same = true;
+        int64 n = r.read(buf, 30000L);
+        while (n > 0L) {
+            for (int64 k = 0L; k < n; k++) {
+                int64 at = total + k;
+                int32 i = (int32) (at / 10000L);
+                int32 j = (int32) (at % 10000L);
+                if (buf[k] != (int8) ((i * 7 + j) & 0x7f)) same = false;
+            }
+            total = total + n;
+            n = r.read(buf, 30000L);
+        }
+        r.close();
+        Assert.isTrue(total == 400000L);
+        Assert.isTrue(same);
+        Assert.isTrue(S3ObjectStoreTest.count(fake, "[Range: bytes=") == 7);
+        return;
+    }
+
+    @Test
+    public void aSmallWriteIsOnePutAndAnAbortedStreamLeavesNothing() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        ObjectWriter w #= s.openWrite("small", "text/plain");
+        int8[] x #= S3ObjectStoreTest.bytes("tiny");
+        w.write(x, 4L);
+        String etag #= w.complete();
+        Assert.isFalse(fake.sent("uploads="));
+        ObjectWriter big #= s.openWrite("abandoned", "application/octet-stream");
+        int8[] chunk = heap int8[50000];
+        big.write(chunk, 50000L);
+        big.write(chunk, 50000L);
+        big.abort();
+        Assert.isTrue(fake.openUploads() == 0);
+        StatResult st #= s.stat("abandoned");
+        Assert.isFalse(st.exists);
+        return;
+    }
+
+    @Test
+    public void theObjectStoreContractHolds() {
+        FakeS3 fake = heap FakeS3();
+        S3ObjectStore s #= S3ObjectStoreTest.store(fake);
+        ObjectStoreContract.verify(s, "conformance/");
+        return;
+    }
+
+    private static #S3ObjectStore store(FakeS3 fake) {
+        return heap S3ObjectStore(fake, "examplebucket", S3ObjectStoreTest.SMALL_PART);
+    }
+
+    private static int32 count(FakeS3 fake, String text) {
+        int32 n = 0;
+        for (int32 i = 0; i < fake.calls(); i++) {
+            if (fake.callAt(i).indexOf(text) >= 0L) n = n + 1;
+        }
+        return n;
+    }
+
+    private static int32 kindOfRange(S3ObjectStore s, String key, int64 off, int64 len) {
+        try {
+            int8[] b #= s.getRange(key, off, len);
+        } catch (CloudException e) {
+            return e.kind();
+        }
+        return -1;
+    }
+
+    private static #int8[] bytes(String s) {
+        return s.toBytes();
+    }
+
+    private static #String text(int8[] b) {
+        int32 n = (int32) b.count();
+        int8[] c = heap int8[n < 1 ? 1 : n];
+        for (int32 i = 0; i < n; i++) c[i] = b[i];
+        return heap String(#c, n);
+    }
+}

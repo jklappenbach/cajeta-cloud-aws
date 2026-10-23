@@ -1,0 +1,21 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.lang.String;
+
+/** One object in FakeS3. */
+final class FakeS3Object {
+    int8[] data;
+    int64 len;
+    String contentType;
+    String etag;
+    int64 modified;
+
+    FakeS3Object(#int8[] data, int64 len, String contentType, String etag, int64 modified) {
+        this.data #= data;
+        this.len = len;
+        this.contentType = "" + contentType;
+        this.etag = "" + etag;
+        this.modified = modified;
+        return;
+    }
+}

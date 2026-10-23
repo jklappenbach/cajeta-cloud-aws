@@ -1,0 +1,420 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.Caps;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.CloudStats;
+import dev.cajeta.cloud.object.CondResult;
+import dev.cajeta.cloud.object.ListPage;
+import dev.cajeta.cloud.object.MultipartUpload;
+import dev.cajeta.cloud.object.ObjectReader;
+import dev.cajeta.cloud.object.ObjectStore;
+import dev.cajeta.cloud.object.ObjectWriter;
+import dev.cajeta.cloud.object.StatResult;
+import dev.cajeta.codec.xml.XmlEvent;
+import dev.cajeta.codec.xml.XmlParseException;
+import dev.cajeta.codec.xml.XmlReader;
+import dev.cajeta.codec.xml.XmlWriter;
+
+/**
+ * cajeta-cloud's object-store port over one S3 bucket (adapters spec 2.4).
+ *
+ * Conditional writes are S3's own: put-if-absent sends `If-None-Match: *`,
+ * put-if-match sends `If-Match: <etag>`; a 412 (or a 404 for If-Match on an
+ * absent key) is a loss, and the loser is told the current etag from a HEAD.
+ * A 409 ConditionalRequestConflict, S3's answer to a racing conditional
+ * write, is retried three times, then reported TRANSIENT.
+ *
+ * Nothing larger than one part is held: `openWrite` buffers one part and
+ * turns into a multipart upload only when a second part is needed, and
+ * `openRead` pulls one part-sized range at a time. Parts are 8 MiB by
+ * default (S3 requires 5 MiB for every part but the last), which bounds an
+ * object written through `openWrite` at 10,000 parts, 78 GiB. Etags are S3's,
+ * quotes included. `delete` asks HEAD first, since S3's DeleteObject answers
+ * 204 whether or not the key existed.
+ */
+public final class S3ObjectStore implements ObjectStore {
+    S3Transport transport;
+    String bucket;
+    int64 partSize;
+    Capabilities caps;
+    CloudStats statsObj;
+
+    public static int64 DEFAULT_PART_SIZE() { return 8388608L; }
+
+    /** The parts an object of `size` bytes takes at `part` bytes a part. */
+    public static int64 partsFor(int64 size, int64 part) {
+        return (size + part - 1L) / part;
+    }
+
+    public S3ObjectStore(S3Transport transport, String bucket, int64 partSize) {
+        this.transport #= transport;
+        this.bucket = "" + bucket;
+        this.partSize = partSize;
+        this.statsObj = heap CloudStats();
+        Capabilities c = heap Capabilities("s3");
+        c.declare(Caps.COND_PUT_CREATE(), "If-None-Match: *");
+        c.declare(Caps.COND_PUT_OVERWRITE(), "If-Match: <etag>");
+        c.declare(Caps.SERVER_SIDE_COPY(), "CopyObject; objects up to 5 GiB");
+        c.declare(Caps.LIST_ORDERED(), "UTF-8 binary order");
+        c.declare(Caps.READ_AFTER_WRITE(), "S3's strong read-after-write consistency");
+        c.declare(Caps.MULTIPART(), "every part but the last must be at least 5 MiB");
+        c.declare(Caps.RANGE_READ(), "");
+        this.caps #= c;
+        return;
+    }
+
+    public Capabilities capabilities() { return this.caps; }
+    public CloudStats stats() { return this.statsObj; }
+
+    public #String put(String key, int8[] bytes, String contentType) {
+        S3Request r = heap S3Request("PUT", key);
+        r.header("Content-Type", contentType);
+        r.body(bytes, bytes.count());
+        S3Reply rep #= this.call(r);
+        if (!S3ObjectStore.ok(rep)) this.fail(rep, "put", key);
+        return rep.headerOr("ETag");
+    }
+
+    public #int8[] get(String key) {
+        S3Request r = heap S3Request("GET", key);
+        S3Reply rep #= this.call(r);
+        if (!S3ObjectStore.ok(rep)) this.fail(rep, "get", key);
+        return S3ObjectStore.exact(rep.body(), 0L, rep.bodyLength());
+    }
+
+    public #StatResult stat(String key) {
+        S3Request r = heap S3Request("HEAD", key);
+        S3Reply rep #= this.call(r);
+        if (rep.status() == 404) {
+            String noType #= "" + "";
+            String noTag #= "" + "";
+            return heap StatResult(false, 0L, #noType, 0L, #noTag);
+        }
+        if (!S3ObjectStore.ok(rep)) this.fail(rep, "stat", key);
+        String len #= rep.headerOr("Content-Length");
+        String ct #= rep.headerOr("Content-Type");
+        String lm #= rep.headerOr("Last-Modified");
+        String etag #= rep.headerOr("ETag");
+        return heap StatResult(true, S3ObjectStore.number(len), #ct, S3Time.httpDate(lm), #etag);
+    }
+
+    public #int8[] getRange(String key, int64 offset, int64 length) {
+        if (offset < 0L || length < 1L) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "getRange", key,
+                "unsatisfiable range: offset " + offset + " length " + length);
+        }
+        S3Request r = heap S3Request("GET", key);
+        r.header("Range", "bytes=" + offset + "-" + (offset + length - 1L));
+        S3Reply rep #= this.call(r);
+        if (rep.status() == 416) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "getRange", key,
+                "unsatisfiable range: offset " + offset + " is at or past the end");
+        }
+        if (!S3ObjectStore.ok(rep)) this.fail(rep, "getRange", key);
+        if (rep.status() == 206) {
+            return S3ObjectStore.exact(rep.body(), 0L, rep.bodyLength());
+        }
+        // A 200 is the whole object: the server ignored the range.
+        int64 end = offset + length;
+        if (end > rep.bodyLength()) end = rep.bodyLength();
+        return S3ObjectStore.exact(rep.body(), offset, end - offset);
+    }
+
+    public boolean delete(String key) {
+        S3Request h = heap S3Request("HEAD", key);
+        S3Reply head #= this.call(h);
+        boolean existed = head.status() == 200;
+        if (head.status() != 404 && !existed) this.fail(head, "delete", key);
+        S3Request r = heap S3Request("DELETE", key);
+        S3Reply rep #= this.call(r);
+        if (!S3ObjectStore.ok(rep)) this.fail(rep, "delete", key);
+        return existed;
+    }
+
+    public #String copy(String srcKey, String dstKey) {
+        S3Request r = heap S3Request("PUT", dstKey);
+        String src #= HttpS3Transport.encode(srcKey, false);
+        r.header("x-amz-copy-source", "/" + this.bucket + "/" + src);
+        S3Reply rep #= this.call(r);
+        String code #= S3Errors.codeOf(rep.body(), rep.bodyLength());
+        if (!S3ObjectStore.ok(rep) || code.byteLength() > 0) {
+            CloudException e #= S3Errors.of(rep, "copy", srcKey);
+            throw e;
+        }
+        return S3ObjectStore.element(rep, "ETag");
+    }
+
+    public #ListPage list(String prefix, String delimiter, String token, int64 maxKeys) {
+        if (maxKeys < 1L) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "list", prefix,
+                "maxKeys must be >= 1");
+        }
+        S3Request r = heap S3Request("GET", "");
+        r.query("list-type", "2");
+        if (prefix.byteLength() > 0) r.query("prefix", prefix);
+        if (delimiter.byteLength() > 0) r.query("delimiter", delimiter);
+        if (token.byteLength() > 0) r.query("continuation-token", token);
+        r.query("max-keys", "" + maxKeys);
+        S3Reply rep #= this.call(r);
+        if (!S3ObjectStore.ok(rep)) this.fail(rep, "list", prefix);
+        ArrayList<String> keys = heap ArrayList<String>();
+        ArrayList<int64> sizes = heap ArrayList<int64>();
+        ArrayList<int64> mods = heap ArrayList<int64>();
+        ArrayList<String> etags = heap ArrayList<String>();
+        ArrayList<String> prefixes = heap ArrayList<String>();
+        String next #= "" + "";
+        boolean truncated = false;
+        try {
+            XmlReader x = heap XmlReader(rep.body(), rep.bodyLength());
+            int32 ev = x.next();
+            while (ev != XmlEvent.END_DOCUMENT) {
+                if (ev == XmlEvent.START_ELEMENT && x.depth() > 1) {
+                    String name = x.name();
+                    if (name.equals("Contents")) {
+                        String key #= "" + "";
+                        String etag #= "" + "";
+                        int64 size = 0L;
+                        int64 mod = 0L;
+                        int32 e = x.next();
+                        while (!(e == XmlEvent.END_ELEMENT && x.name().equals("Contents"))) {
+                            if (e == XmlEvent.START_ELEMENT) {
+                                String child = x.name();
+                                if (child.equals("Key")) key #= x.readText();
+                                else if (child.equals("ETag")) etag #= x.readText();
+                                else if (child.equals("Size")) {
+                                    String t #= x.readText();
+                                    size = S3ObjectStore.number(t);
+                                } else if (child.equals("LastModified")) {
+                                    String t #= x.readText();
+                                    mod = S3Time.iso8601(t);
+                                } else {
+                                    x.skip();
+                                }
+                            }
+                            e = x.next();
+                        }
+                        keys.add(#key);
+                        etags.add(#etag);
+                        sizes.add(size);
+                        mods.add(mod);
+                    } else if (name.equals("CommonPrefixes")) {
+                        int32 e = x.next();
+                        while (!(e == XmlEvent.END_ELEMENT && x.name().equals("CommonPrefixes"))) {
+                            if (e == XmlEvent.START_ELEMENT) {
+                                if (x.name().equals("Prefix")) {
+                                    String p #= x.readText();
+                                    prefixes.add(#p);
+                                } else {
+                                    x.skip();
+                                }
+                            }
+                            e = x.next();
+                        }
+                    } else if (name.equals("NextContinuationToken")) {
+                        next #= x.readText();
+                    } else if (name.equals("IsTruncated")) {
+                        String t #= x.readText();
+                        truncated = t.equals("true");
+                    } else {
+                        x.skip();
+                    }
+                }
+                ev = x.next();
+            }
+        } catch (XmlParseException e) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "list", prefix,
+                "the ListObjectsV2 answer was not well-formed XML");
+        }
+        if (!truncated) next #= "" + "";
+        int32 n = keys.count();
+        String[] ka = heap String[n];
+        int64[] sa = heap int64[n];
+        int64[] ma = heap int64[n];
+        String[] ea = heap String[n];
+        for (int32 i = 0; i < n; i++) {
+            String k = "" + keys.get(i);
+            String t = "" + etags.get(i);
+            ka[i] #= k;
+            ea[i] #= t;
+            sa[i] = sizes.get(i);
+            ma[i] = mods.get(i);
+        }
+        int32 pn = prefixes.count();
+        String[] pa = heap String[pn];
+        for (int32 i = 0; i < pn; i++) {
+            String p = "" + prefixes.get(i);
+            pa[i] #= p;
+        }
+        return heap ListPage(#ka, #sa, #ma, #ea, #pa, #next, true);
+    }
+
+    public #ObjectReader openRead(String key) {
+        StatResult st #= this.stat(key);
+        if (!st.exists) {
+            throw heap CloudException(CloudException.NOT_FOUND(), "s3", "openRead", key, "no such object");
+        }
+        return heap S3Reader(this, key, st.size, this.partSize);
+    }
+
+    public #ObjectWriter openWrite(String key, String contentType) {
+        return heap S3Writer(this, key, contentType, this.partSize);
+    }
+
+    public #MultipartUpload beginMultipart(String key, String contentType) {
+        String id #= this.createUpload(key, contentType);
+        return heap S3Multipart(this, key, id);
+    }
+
+    public #CondResult putIfAbsent(String key, int8[] bytes, String contentType) {
+        return this.conditional("putIfAbsent", key, bytes, contentType, "If-None-Match", "*");
+    }
+
+    public #CondResult putIfMatch(String key, int8[] bytes, String contentType, String etag) {
+        return this.conditional("putIfMatch", key, bytes, contentType, "If-Match", etag);
+    }
+
+    private #CondResult conditional(String op, String key, int8[] bytes, String contentType,
+                                    String header, String value) {
+        int32 attempt = 0;
+        while (true) {
+            S3Request r = heap S3Request("PUT", key);
+            r.header("Content-Type", contentType);
+            r.header(header, value);
+            r.body(bytes, bytes.count());
+            S3Reply rep #= this.call(r);
+            if (S3ObjectStore.ok(rep)) {
+                String etag #= rep.headerOr("ETag");
+                return heap CondResult(true, #etag);
+            }
+            String code #= S3Errors.codeOf(rep.body(), rep.bodyLength());
+            if (rep.status() == 412 || (rep.status() == 404 && header.equals("If-Match"))) {
+                StatResult st #= this.stat(key);
+                String current #= "" + "";
+                if (st.exists) current #= "" + st.etag;
+                return heap CondResult(false, #current);
+            }
+            if (code.equals("ConditionalRequestConflict") && attempt < 3) {
+                attempt = attempt + 1;
+                continue;
+            }
+            CloudException e #= S3Errors.of(rep, op, key);
+            throw e;
+        }
+    }
+
+    // ── multipart, shared by S3Multipart and S3Writer ────────────────
+
+    #String createUpload(String key, String contentType) {
+        S3Request r = heap S3Request("POST", key);
+        r.query("uploads", "");
+        r.header("Content-Type", contentType);
+        S3Reply rep #= this.call(r);
+        if (!S3ObjectStore.ok(rep)) this.fail(rep, "beginMultipart", key);
+        return S3ObjectStore.element(rep, "UploadId");
+    }
+
+    #String uploadPart(String key, String uploadId, int32 number, int8[] bytes, int64 len) {
+        S3Request r = heap S3Request("PUT", key);
+        r.query("partNumber", "" + number);
+        r.query("uploadId", uploadId);
+        r.body(bytes, len);
+        S3Reply rep #= this.call(r);
+        if (!S3ObjectStore.ok(rep)) this.fail(rep, "addPart", key);
+        return rep.headerOr("ETag");
+    }
+
+    #String completeUpload(String key, String uploadId, ArrayList<int32> numbers, ArrayList<String> etags) {
+        XmlWriter w = heap XmlWriter();
+        w.start("CompleteMultipartUpload");
+        for (int32 i = 0; i < numbers.count(); i++) {
+            w.start("Part");
+            w.element("PartNumber", "" + numbers.get(i));
+            w.element("ETag", etags.get(i));
+            w.end();
+        }
+        w.end();
+        String xml #= w.toString();
+        int8[] body #= xml.toBytes();
+        S3Request r = heap S3Request("POST", key);
+        r.query("uploadId", uploadId);
+        r.body(body, (int64) xml.byteLength());
+        S3Reply rep #= this.call(r);
+        // CompleteMultipartUpload can answer 200 with an <Error> body.
+        String code #= S3Errors.codeOf(rep.body(), rep.bodyLength());
+        if (!S3ObjectStore.ok(rep) || code.byteLength() > 0) {
+            CloudException e #= S3Errors.of(rep, "complete", key);
+            throw e;
+        }
+        return S3ObjectStore.element(rep, "ETag");
+    }
+
+    void abortUpload(String key, String uploadId) {
+        S3Request r = heap S3Request("DELETE", key);
+        r.query("uploadId", uploadId);
+        S3Reply rep #= this.call(r);
+        if (!S3ObjectStore.ok(rep) && rep.status() != 404) this.fail(rep, "abort", key);
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    private #S3Reply call(S3Request r) {
+        S3Reply rep #= this.transport.send(r);
+        int64 sent = r.bodyLength();
+        if (sent < 0L) sent = 0L;
+        this.statsObj.recordCall(0L, sent, rep.bodyLength(), rep.status() >= 500);
+        return #rep;
+    }
+
+    private void fail(S3Reply rep, String operation, String key) {
+        CloudException e #= S3Errors.of(rep, operation, key);
+        throw e;
+    }
+
+    static boolean ok(S3Reply r) {
+        return r.status() >= 200 && r.status() < 300;
+    }
+
+    // A copy of `len` bytes of `src` from `from`.
+    static #int8[] exact(int8[] src, int64 from, int64 len) {
+        int64 n = len;
+        if (n < 0L) n = 0L;
+        int8[] out = heap int8[n];
+        for (int64 i = 0L; i < n; i++) out[i] = src[from + i];
+        return #out;
+    }
+
+    static int64 number(String s) {
+        int64 v = 0L;
+        for (int32 i = 0; i < s.byteLength(); i++) {
+            int32 c = (int32) s.byteAt(i);
+            if (c < 48 || c > 57) return v;
+            v = v * 10L + (int64) (c - 48);
+        }
+        return v;
+    }
+
+    // The text of the first element named `name` in the reply's XML, or "".
+    static #String element(S3Reply rep, String name) {
+        String out #= "" + "";
+        if (rep.bodyLength() > 0L) {
+            try {
+                XmlReader x = heap XmlReader(rep.body(), rep.bodyLength());
+                int32 ev = x.next();
+                boolean done = false;
+                while (!done && ev != XmlEvent.END_DOCUMENT) {
+                    if (ev == XmlEvent.START_ELEMENT && x.name().equals(name)) {
+                        out #= x.readText();
+                        done = true;
+                    }
+                    if (!done) ev = x.next();
+                }
+            } catch (XmlParseException e) {
+                out #= "" + "";
+            }
+        }
+        return #out;
+    }
+}

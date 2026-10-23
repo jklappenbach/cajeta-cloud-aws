@@ -1,0 +1,46 @@
+package dev.cajeta.cloud.aws.selftest;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+
+/** An open multipart upload in FakeS3; a re-uploaded part replaces the earlier one. */
+final class FakeS3Upload {
+    String key;
+    String contentType;
+    ArrayList<int32> numbers;
+    ArrayList<int8[]> datas;
+    ArrayList<int64> lens;
+    ArrayList<String> tags;
+
+    FakeS3Upload(String key, String contentType) {
+        this.key = "" + key;
+        this.contentType = "" + contentType;
+        this.numbers = heap ArrayList<int32>();
+        this.datas = heap ArrayList<int8[]>();
+        this.lens = heap ArrayList<int64>();
+        this.tags = heap ArrayList<String>();
+        return;
+    }
+
+    int32 indexOf(int32 number) {
+        for (int32 i = 0; i < this.numbers.count(); i++) {
+            if (this.numbers.get(i) == number) return i;
+        }
+        return -1;
+    }
+
+    void put(int32 number, #int8[] data, int64 len, String etag) {
+        int32 at = this.indexOf(number);
+        String t = "" + etag;
+        if (at >= 0) {
+            this.datas.set(at, #data);
+            this.lens.set(at, len);
+            this.tags.set(at, #t);
+            return;
+        }
+        this.numbers.add(number);
+        this.datas.add(#data);
+        this.lens.add(len);
+        this.tags.add(#t);
+    }
+}

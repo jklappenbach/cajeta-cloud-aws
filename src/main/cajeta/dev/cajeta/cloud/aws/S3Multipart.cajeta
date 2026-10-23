@@ -1,0 +1,67 @@
+package dev.cajeta.cloud.aws;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.object.MultipartUpload;
+
+/** One S3 multipart upload (port §8): parts may arrive in any order; a re-upload replaces. */
+final class S3Multipart implements MultipartUpload {
+    S3ObjectStore store;
+    String key;
+    String uploadId;
+    ArrayList<int32> numbers;
+    ArrayList<String> etags;
+    boolean closed;
+
+    S3Multipart(S3ObjectStore store, String key, String uploadId) {
+        this.store #= store;
+        this.key = "" + key;
+        this.uploadId = "" + uploadId;
+        this.numbers = heap ArrayList<int32>();
+        this.etags = heap ArrayList<String>();
+        this.closed = false;
+        return;
+    }
+
+    public void addPart(int32 partNumber, int8[] bytes) {
+        if (this.closed) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "addPart", this.key,
+                "upload already closed");
+        }
+        if (partNumber < 1 || partNumber > 10000) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "addPart", this.key,
+                "part number " + (int64) partNumber + " out of [1, 10000]");
+        }
+        String etag #= this.store.uploadPart(this.key, this.uploadId, partNumber, bytes, bytes.count());
+        // Keep the lists ordered by part number, as S3's complete requires;
+        // a re-uploaded part replaces its etag.
+        int32 at = 0;
+        while (at < this.numbers.count() && this.numbers.get(at) < partNumber) at = at + 1;
+        if (at < this.numbers.count() && this.numbers.get(at) == partNumber) {
+            this.etags.set(at, #etag);
+        } else {
+            this.numbers.insert(at, partNumber);
+            this.etags.insert(at, #etag);
+        }
+    }
+
+    public #String complete() {
+        if (this.closed) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "complete", this.key,
+                "upload already closed");
+        }
+        if (this.numbers.count() == 0) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "s3", "complete", this.key,
+                "no parts uploaded");
+        }
+        this.closed = true;
+        return this.store.completeUpload(this.key, this.uploadId, this.numbers, this.etags);
+    }
+
+    public void abort() {
+        if (this.closed) return;
+        this.closed = true;
+        this.store.abortUpload(this.key, this.uploadId);
+    }
+}
