@@ -1,5 +1,7 @@
 package dev.cajeta.cloud.aws;
 
+import dev.cajeta.cloud.s3.SigV4Signer;
+import dev.cajeta.cloud.s3.S3Credentials;
 import cajeta.error.RecoverableException;
 import cajeta.lang.String;
 import dev.cajeta.cloud.identity.IdentityException;
@@ -20,12 +22,12 @@ import dev.cajeta.http.client.HttpClient;
 public final class HttpCognitoTransport implements CognitoTransport {
     String region;
     String endpoint;
-    AwsCredentials creds;
+    S3Credentials creds;
     TimeSource clock;
     HttpClient client;
 
     /** `credentials` may be null: then only user-facing calls work. */
-    public HttpCognitoTransport(String region, AwsCredentials credentials, TimeSource clock) {
+    public HttpCognitoTransport(String region, S3Credentials credentials, TimeSource clock) {
         this.region = "" + region;
         this.endpoint #= HttpCognitoTransport.endpointFor(region);
         this.creds #= credentials;

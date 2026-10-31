@@ -6,18 +6,18 @@
 # an executable with the library and every dependency archive on the classpath.
 #
 # Each dependency archive resolves in this order (the cajeta-cloud pattern):
-#   1. $<NAME>_CJA       explicit path (CLOUD_CJA, HTTP_CJA, CRYPTO_CJA,
-#                        CODEC_CJA, UNIT_CJA), used verbatim
+#   1. $<NAME>_CJA       explicit path (CLOUD_CJA, S3_CJA, HTTP_CJA,
+#                        CRYPTO_CJA, CODEC_CJA, UNIT_CJA), used verbatim
 #   2. the Olla store    $OLLA_HOME/<name>/<pin>/, at the cajeta.json pin
 #   3. build/.dep-cache  an earlier fetch
 #   4. Olla              /v2/resolve + /v2/blob, sha256-verified
-# cajeta-unit additionally builds from a sibling checkout ($UNIT_REPO) when one
-# exists, as the other libraries do.
+# cajeta-unit and cajeta-cloud-s3 additionally build from a sibling checkout
+# ($UNIT_REPO, $S3_REPO) when one exists, as the other libraries do.
 #
-# No test here reaches AWS: SigV4 runs on published vectors and the adapters on
-# recorded responses (cajeta-cloud-adapters spec §2.5).
+# No test here reaches AWS: the adapters run on recorded responses
+# (cajeta-cloud-adapters spec §2.5); SigV4's vectors live in cajeta-cloud-s3.
 #
-# Env: CAJETA (compiler, default cajeta on PATH), OLLA_HOME, OLLA_URL, UNIT_REPO.
+# Env: CAJETA (compiler, default cajeta on PATH), OLLA_HOME, OLLA_URL, UNIT_REPO, S3_REPO.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -25,6 +25,7 @@ CAJETA="${CAJETA:-cajeta}"
 OLLA_HOME="${OLLA_HOME:-$HOME/.olla}"
 OLLA_URL="${OLLA_URL:-https://olla.cajeta.dev}"
 UNIT_REPO="${UNIT_REPO:-$here/../cajeta-unit}"
+S3_REPO="${S3_REPO:-$here/../cajeta-cloud-s3}"
 
 out="$(mktemp -d)"
 # KEEP_OUT=1 keeps the build directory (the test binary) for a rerun or a debugger.
@@ -76,14 +77,21 @@ if [[ -z "$unit_cja" && -d "$UNIT_REPO" ]]; then
 fi
 unit_cja="$(resolve dev.cajeta.unit "$unit_cja")"
 cloud_cja="$(resolve dev.cajeta.cloud "${CLOUD_CJA:-}")"
+s3_cja="${S3_CJA:-}"
+if [[ -z "$s3_cja" && -d "$S3_REPO" ]]; then
+    echo ">> building cajeta-cloud-s3 from checkout ($S3_REPO)"
+    ( cd "$S3_REPO" && "$CAJETA" build >/dev/null )
+    s3_cja="$S3_REPO/build/archive/dev.cajeta.cloud.s3-$(pin_of dev.cajeta.cloud.s3).cja"
+fi
+s3_cja="$(resolve dev.cajeta.cloud.s3 "$s3_cja")"
 http_cja="$(resolve dev.cajeta.http "${HTTP_CJA:-}")"
 crypto_cja="$(resolve dev.cajeta.crypto "${CRYPTO_CJA:-}")"
 codec_cja="$(resolve dev.cajeta.codec "${CODEC_CJA:-}")"
-for a in "$unit_cja" "$cloud_cja" "$http_cja" "$crypto_cja" "$codec_cja"; do
+for a in "$unit_cja" "$cloud_cja" "$s3_cja" "$http_cja" "$crypto_cja" "$codec_cja"; do
     [[ -f "$a" ]] || { echo "missing archive: $a" >&2; exit 1; }
     echo ">> classpath: $a"
 done
-deps="$cloud_cja,$http_cja,$crypto_cja,$codec_cja"
+deps="$cloud_cja,$s3_cja,$http_cja,$crypto_cja,$codec_cja"
 
 # details.version is the source of truth and Aws.version() hands consumers a
 # literal copy; the library cannot read its own manifest, so the check is here.
@@ -105,5 +113,4 @@ echo ">> building + running the test binary"
     -o "$out/awstests" \
     dev.cajeta.cloud.aws.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
-# The SigV4 test-suite vectors (awslabs/aws-c-auth, vendored) read from here.
-AWS_SIGV4_VECTORS="$here/src/test/resources/sigv4" COGNITO_FIXTURES="$here/src/test/resources/cognito" CAJETA_AWS_TEST_TMP="$out" "$out/awstests"
+COGNITO_FIXTURES="$here/src/test/resources/cognito" CAJETA_AWS_TEST_TMP="$out" "$out/awstests"

@@ -1,5 +1,6 @@
 package dev.cajeta.cloud.aws;
 
+import dev.cajeta.cloud.s3.S3Credentials;
 import cajeta.codec.json.JsonArray;
 import cajeta.codec.json.JsonValue;
 import cajeta.collection.ArrayList;
@@ -109,7 +110,7 @@ public final class CognitoUserPool implements UserPool {
         }
         String secret #= CognitoUserPool.env("COGNITO_CLIENT_SECRET");
         String region #= CredentialChain.region(null);
-        AwsCredentials creds = null;
+        S3Credentials creds = null;
         try {
             creds #= CredentialChain.resolve(null);
         } catch (AwsConfigurationException e) {

@@ -1,6 +1,8 @@
 # cajeta-cloud-aws
 
-The Cognito and S3 adapters for dev.cajeta.cloud (package `dev.cajeta.cloud.aws`).
+The Cognito adapter and the AWS way into S3 for dev.cajeta.cloud (package
+`dev.cajeta.cloud.aws`). The S3 client is `dev.cajeta.cloud.s3` (sibling
+`cajeta-cloud-s3`, since 2026-10-30); `AwsS3.connect` builds one from the chain.
 Spec and plan: `specs/cajeta-cloud-adapters-spec.md` and
 `agents/cajeta-cloud-adapters-plan.md` in the cajeta repository; this repo
 carries no specs of its own.

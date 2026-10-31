@@ -1,11 +1,11 @@
 package dev.cajeta.cloud.aws.selftest;
 
+import dev.cajeta.cloud.s3.S3Credentials;
 import cajeta.codec.json.JsonValue;
 import cajeta.lang.String;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.cloud.identity.IdentityException;
 import dev.cajeta.cloud.identity.ManualTimeSource;
-import dev.cajeta.cloud.aws.AwsCredentials;
 import dev.cajeta.cloud.aws.CognitoClient;
 import dev.cajeta.cloud.aws.CognitoErrors;
 import dev.cajeta.cloud.aws.HttpCognitoTransport;
@@ -114,7 +114,7 @@ public class CognitoClientTest {
     @Test
     public void theHttpRequestCarriesTheTargetAndTypeAndASignatureWhenAdmin() {
         ManualTimeSource clock = heap ManualTimeSource(1767225600L);
-        AwsCredentials creds = heap AwsCredentials("AKIAIOSFODNN7EXAMPLE",
+        S3Credentials creds = heap S3Credentials("AKIAIOSFODNN7EXAMPLE",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", null);
         HttpCognitoTransport h = heap HttpCognitoTransport("eu-west-2", creds, clock);
         ClientRequest r #= h.request("InitiateAuth", "{\"AuthFlow\":\"USER_SRP_AUTH\"}", false);

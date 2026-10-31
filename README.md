@@ -6,7 +6,7 @@ ports, written in Cajeta:
 | Port | Adapter | Selection |
 |---|---|---|
 | identity (`UserPool`, `Authenticator`, `Account`, `TokenVerifier`) | Amazon Cognito user pools, SRP sign-in, TOTP | `IDENTITY_PROVIDER=cognito` |
-| object store | Amazon S3 and S3-compatible endpoints, conditional writes, multipart | `S3ObjectStore.connect(bucket, ...)` |
+| object store | Amazon S3 through the AWS chain; the client itself is [cajeta-cloud-s3](https://github.com/jklappenbach/cajeta-cloud-s3) | `AwsS3.connect(bucket, ...)` |
 
 Requests are signed with AWS Signature Version 4 over
 [cajeta-http](https://github.com/jklappenbach/cajeta-http). Credentials resolve
@@ -26,12 +26,11 @@ configuration grants; the skill `aws-cognito-identity` covers its behaviour.
 ./run-tests.sh
 ```
 
-The suite needs no AWS account: SigV4 is proven against AWS's published test
-vectors, and the Cognito adapter against scripted responses in the shapes the
-cognito-idp API reference documents, with a test double that plays the server
-side of SRP and checks the client's claim; the S3 adapter against an in-memory
-bucket that answers in S3's documented shapes, with the port's conformance
-suite run over it. The identity conformance suite runs
+The suite needs no AWS account: the Cognito adapter runs against scripted
+responses in the shapes the cognito-idp API reference documents, with a test
+double that plays the server side of SRP and checks the client's claim. SigV4
+and the S3 store are tested in cajeta-cloud-s3, which this suite builds from a
+sibling checkout (`S3_REPO`) or takes from `S3_CJA` until it is on Olla. The identity conformance suite runs
 against a real pool when `CAJETA_AWS_TEST_POOL` and `CAJETA_AWS_TEST_CLIENT`
 are set, and against a real bucket when `CAJETA_AWS_TEST_BUCKET` is; both are
 skipped otherwise. Dependency archives

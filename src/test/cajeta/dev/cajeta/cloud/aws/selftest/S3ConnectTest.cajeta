@@ -8,7 +8,8 @@ import dev.cajeta.cloud.Caps;
 import dev.cajeta.cloud.testkit.ObjectStoreContract;
 import dev.cajeta.cloud.aws.AwsConfig;
 import dev.cajeta.cloud.aws.AwsConfigurationException;
-import dev.cajeta.cloud.aws.S3ObjectStore;
+import dev.cajeta.cloud.aws.AwsS3;
+import dev.cajeta.cloud.s3.S3ObjectStore;
 
 /**
  * Building an S3ObjectStore from the AWS chain (adapters spec 2.1, 2.4), and
@@ -33,7 +34,7 @@ public class S3ConnectTest {
         System.env.set("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/cajeta-aws/credentials");
         String message = "";
         try {
-            S3ObjectStore s #= S3ObjectStore.connect("examplebucket", null, false, null);
+            S3ObjectStore s #= AwsS3.connect("examplebucket", null, false, null);
         } catch (AwsConfigurationException e) {
             message = "" + e.message;
         }
@@ -45,7 +46,7 @@ public class S3ConnectTest {
     public void connectWithAConfigBuildsAStoreWithoutCallingAws() {
         AwsConfig config = heap AwsConfig("AKIAIOSFODNN7EXAMPLE",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", null, "eu-west-2");
-        S3ObjectStore s #= S3ObjectStore.connect("examplebucket", "http://localhost:9000", true, config);
+        S3ObjectStore s #= AwsS3.connect("examplebucket", "http://localhost:9000", true, config);
         Capabilities c = s.capabilities();
         String name #= c.adapterName();
         Assert.equals("s3", name);
@@ -65,7 +66,7 @@ public class S3ConnectTest {
         if (endpoint != null && endpoint.byteLength() == 0) endpoint = null;
         String ps = System.env.get("CAJETA_AWS_TEST_S3_PATH_STYLE");
         boolean pathStyle = ps != null && ps.equals("1");
-        S3ObjectStore s #= S3ObjectStore.connect(bucket, endpoint, pathStyle, null);
+        S3ObjectStore s #= AwsS3.connect(bucket, endpoint, pathStyle, null);
         ObjectStoreContract.verify(s, "cajeta-conformance/");
         return;
     }

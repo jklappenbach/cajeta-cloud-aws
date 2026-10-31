@@ -1,7 +1,9 @@
 {
     // cajeta-cloud-aws — the AWS adapters for dev.cajeta.cloud's ports: the
-    // Cognito user-pool identity adapter and the S3 object-store adapter, over
-    // cajeta-http, signed with SigV4 (cajeta-cloud-adapters spec §2).
+    // Cognito user-pool identity adapter and S3 through the AWS credential
+    // chain, over cajeta-http, signed with SigV4 (cajeta-cloud-adapters spec
+    // §2). The S3 client itself is dev.cajeta.cloud.s3, shared with the
+    // other S3-compatible providers (cajeta-cloud-cloudflare spec §2).
     //
     // Capabilities: `network` for the service endpoints, `env` and
     // `filesystem` for the credential chain (AWS_* variables, then
@@ -30,6 +32,7 @@
         // highest of the floors.
         "dependencies": {
             "dev.cajeta.cloud":  "0.4.1",
+            "dev.cajeta.cloud.s3": "0.1.0",
             "dev.cajeta.http":   "0.9.1",
             "dev.cajeta.codec":  "0.9.1",
             "dev.cajeta.crypto": "0.2.0"
