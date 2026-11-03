@@ -29,8 +29,8 @@ configuration grants; the skill `aws-cognito-identity` covers its behaviour.
 The suite needs no AWS account: the Cognito adapter runs against scripted
 responses in the shapes the cognito-idp API reference documents, with a test
 double that plays the server side of SRP and checks the client's claim. SigV4
-and the S3 store are tested in cajeta-cloud-s3, which this suite builds from a
-sibling checkout (`S3_REPO`) or takes from `S3_CJA` until it is on Olla. The identity conformance suite runs
+and the S3 store are tested in cajeta-cloud-s3, which this suite fetches from
+Olla, builds from a sibling checkout (`S3_REPO`), or takes from `S3_CJA`. The identity conformance suite runs
 against a real pool when `CAJETA_AWS_TEST_POOL` and `CAJETA_AWS_TEST_CLIENT`
 are set, and against a real bucket when `CAJETA_AWS_TEST_BUCKET` is; both are
 skipped otherwise. Dependency archives
